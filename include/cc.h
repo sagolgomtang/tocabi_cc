@@ -164,6 +164,8 @@ public:
     bool use_obs_joint_vel_lpf_ = true;
     bool use_dtau_joint_vel_lpf_ = true;
     bool obs_history_layout_warned_ = false;
+    std::array<std::array<double, 2>, num_actuator_action> leg_joint_pos_limits_;
+    std::array<std::array<double, 2>, num_arm_action> arm_joint_pos_limits_;
     std::string policy_with_arm_path_;
     std::string policy_without_arm_path_;
     // Joystick

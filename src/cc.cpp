@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <xmlrpcpp/XmlRpcValue.h>
 
 using namespace TOCABI;
 
@@ -54,6 +55,33 @@ constexpr std::array<std::array<double, 2>, CustomController::num_arm_action> kA
     {-1.6, -0.75},
     {0.5, 1.5},    // right arms
 }};
+
+template <size_t N>
+bool loadLimits2DParam(ros::NodeHandle &nh, const std::string &name, std::array<std::array<double, 2>, N> &out)
+{
+    XmlRpc::XmlRpcValue v;
+    if (!nh.getParam(name, v))
+    {
+        return false;
+    }
+    if (v.getType() != XmlRpc::XmlRpcValue::TypeArray || v.size() != static_cast<int>(N))
+    {
+        ROS_WARN_STREAM(name << " must be an array with " << N << " entries.");
+        return false;
+    }
+    for (size_t i = 0; i < N; ++i)
+    {
+        if (v[static_cast<int>(i)].getType() != XmlRpc::XmlRpcValue::TypeArray ||
+            v[static_cast<int>(i)].size() != 2)
+        {
+            ROS_WARN_STREAM(name << "[" << i << "] must be [min, max].");
+            return false;
+        }
+        out[i][0] = static_cast<double>(v[static_cast<int>(i)][0]);
+        out[i][1] = static_cast<double>(v[static_cast<int>(i)][1]);
+    }
+    return true;
+}
 
 
 // Arm order (elbow before armlink) for future action/obs mapping.
@@ -347,6 +375,8 @@ void CustomController::initVariable()
 
     q_dot_lpf_.setZero();
 
+    leg_joint_pos_limits_ = kLegJointPosLimits;
+    arm_joint_pos_limits_ = kArmJointPosLimits;
     torque_bound_ << 333, 232, 263, 289, 222, 166,
                     333, 232, 263, 289, 222, 166,
                     303, 303, 303, 
@@ -388,6 +418,32 @@ void CustomController::initVariable()
                         10.0, 28.0, 10.0, 10.0, 10.0, 10.0, 3.0, 3.0,
                         2.0, 2.0,
                         10.0, 28.0, 10.0, 10.0, 10.0, 10.0, 3.0, 3.0;
+
+    std::vector<double> vec_param;
+    if (nh_.getParam("/tocabi_cc/torque_bound", vec_param) &&
+        vec_param.size() == static_cast<size_t>(MODEL_DOF))
+    {
+        for (int i = 0; i < MODEL_DOF; ++i) torque_bound_(i) = vec_param[i];
+    }
+    if (nh_.getParam("/tocabi_cc/q_init", vec_param) &&
+        vec_param.size() == static_cast<size_t>(MODEL_DOF))
+    {
+        for (int i = 0; i < MODEL_DOF; ++i) q_init_(i) = vec_param[i];
+        q_init_mode7_ = q_init_;
+        pace_hold_q_ = q_init_;
+    }
+    if (nh_.getParam("/tocabi_cc/kp_diag", vec_param) &&
+        vec_param.size() == static_cast<size_t>(MODEL_DOF))
+    {
+        for (int i = 0; i < MODEL_DOF; ++i) kp_(i, i) = vec_param[i];
+    }
+    if (nh_.getParam("/tocabi_cc/kv_diag", vec_param) &&
+        vec_param.size() == static_cast<size_t>(MODEL_DOF))
+    {
+        for (int i = 0; i < MODEL_DOF; ++i) kv_(i, i) = vec_param[i];
+    }
+    loadLimits2DParam(nh_, "/tocabi_cc/leg_joint_pos_limits", leg_joint_pos_limits_);
+    loadLimits2DParam(nh_, "/tocabi_cc/arm_joint_pos_limits", arm_joint_pos_limits_);
 
     action_offset_.setZero();
     action_scale_.setIdentity();
@@ -446,8 +502,8 @@ void CustomController::loadJointLimits()
     for (int i = 0; i < num_actuator_action; i++)
     {
         int joint_idx = kLegJointMapAction[i];
-        q_min_(joint_idx) = kLegJointPosLimits[i][0] * q_limit_scale_;
-        q_max_(joint_idx) = kLegJointPosLimits[i][1] * q_limit_scale_;
+        q_min_(joint_idx) = leg_joint_pos_limits_[i][0] * q_limit_scale_;
+        q_max_(joint_idx) = leg_joint_pos_limits_[i][1] * q_limit_scale_;
     }
 
     has_joint_limits_ = true;
@@ -1792,8 +1848,8 @@ void CustomController::computeSlow()
                 for (int i = 0; i < num_actuator_action; i++)
                 {
                     double a = DyrosMath::minmax_cut(rl_action_(i), -1.0, 1.0);
-                    const double lo = kLegJointPosLimits[i][0] * q_limit_scale_;
-                    const double hi = kLegJointPosLimits[i][1] * q_limit_scale_;
+                    const double lo = leg_joint_pos_limits_[i][0] * q_limit_scale_;
+                    const double hi = leg_joint_pos_limits_[i][1] * q_limit_scale_;
                     double target = 0.5 * (a + 1.0) * (hi - lo) + lo;
                 if (has_joint_limits_)
                 {
@@ -1943,6 +1999,30 @@ void CustomController::computeSlow()
             }
         };
         const bool mode7_rising = (prev_tc_mode_ != 7);
+        auto get_required_leg_hist_len = [&]() -> size_t {
+            if (!use_obs_history_layout_)
+            {
+                return 0;
+            }
+            if (input_obs_idx_ < 0 || input_obs_idx_ >= static_cast<int>(input_states_buffer.size()))
+            {
+                return 0;
+            }
+            constexpr size_t kHistCoreDim = 30;
+            constexpr size_t kCurrOnlyDim = 17;
+            const size_t obs_size = input_states_buffer[input_obs_idx_].size();
+            if (obs_size < kCurrOnlyDim)
+            {
+                return 0;
+            }
+            const size_t hist_residual = obs_size - kCurrOnlyDim;
+            if (hist_residual % kHistCoreDim != 0)
+            {
+                return 0;
+            }
+            const size_t hist_len = hist_residual / kHistCoreDim;
+            return hist_len;
+        };
         if (mode7_rising)
         {
             test_log_step_ = 0;
@@ -2105,25 +2185,35 @@ void CustomController::computeSlow()
             //     }
             //     ROS_INFO_STREAM(oss.str());
             // }
-            feedforwardPolicy();
-            test_policy_step_++;
+            const size_t required_hist_len = get_required_leg_hist_len();
+            const bool hist_ready = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
+            if (hist_ready)
             {
-                double mean_abs = 0.0;
-                double max_abs = 0.0;
-                for (int i = 0; i < num_action; i++)
+                feedforwardPolicy();
+                test_policy_step_++;
                 {
-                    const double av = std::abs(action_rate_(i));
-                    mean_abs += av;
-                    if (av > max_abs) max_abs = av;
+                    double mean_abs = 0.0;
+                    double max_abs = 0.0;
+                    for (int i = 0; i < num_action; i++)
+                    {
+                        const double av = std::abs(action_rate_(i));
+                        mean_abs += av;
+                        if (av > max_abs) max_abs = av;
+                    }
+                    test_action_rate_stats_last_mean_abs_ = mean_abs / static_cast<double>(num_action);
+                    test_action_rate_stats_last_max_abs_ = max_abs;
+                    test_action_rate_stats_last_valid_ = true;
                 }
-                test_action_rate_stats_last_mean_abs_ = mean_abs / static_cast<double>(num_action);
-                test_action_rate_stats_last_max_abs_ = max_abs;
-                test_action_rate_stats_last_valid_ = true;
+                if (use_arm_policy_)
+                {
+                    processArmObservation();
+                    feedforwardArmPolicy();
+                }
             }
-            if (use_arm_policy_)
+            else
             {
-                processArmObservation();
-                feedforwardArmPolicy();
+                rl_action_.setZero();
+                rl_action_arm_.setZero();
             }
             for (int i = 0; i < num_state_skip * num_state_hist; i++)
             {
@@ -2156,6 +2246,7 @@ void CustomController::computeSlow()
             mode7_send_triggered_ = false;
         }
         processNoise();
+        bool mode7_policy_ran_this_tick = false;
 
         if ((rd_cc_.control_time_us_ - time_inference_pre_) / 1.0e6 >= 1 / 100.0)
         {
@@ -2183,25 +2274,36 @@ void CustomController::computeSlow()
             //     }
             //     ROS_INFO_STREAM(oss.str());
             // }
-            feedforwardPolicy();
-            test_policy_step_++;
+            const size_t required_hist_len = get_required_leg_hist_len();
+            const bool hist_ready = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
+            if (hist_ready)
             {
-                double mean_abs = 0.0;
-                double max_abs = 0.0;
-                for (int i = 0; i < num_action; i++)
+                feedforwardPolicy();
+                mode7_policy_ran_this_tick = true;
+                test_policy_step_++;
                 {
-                    const double av = std::abs(action_rate_(i));
-                    mean_abs += av;
-                    if (av > max_abs) max_abs = av;
+                    double mean_abs = 0.0;
+                    double max_abs = 0.0;
+                    for (int i = 0; i < num_action; i++)
+                    {
+                        const double av = std::abs(action_rate_(i));
+                        mean_abs += av;
+                        if (av > max_abs) max_abs = av;
+                    }
+                    test_action_rate_stats_last_mean_abs_ = mean_abs / static_cast<double>(num_action);
+                    test_action_rate_stats_last_max_abs_ = max_abs;
+                    test_action_rate_stats_last_valid_ = true;
                 }
-                test_action_rate_stats_last_mean_abs_ = mean_abs / static_cast<double>(num_action);
-                test_action_rate_stats_last_max_abs_ = max_abs;
-                test_action_rate_stats_last_valid_ = true;
+                if (use_arm_policy_)
+                {
+                    processArmObservation();
+                    feedforwardArmPolicy();
+                }
             }
-            if (use_arm_policy_)
+            else
             {
-                processArmObservation();
-                feedforwardArmPolicy();
+                rl_action_.setZero();
+                rl_action_arm_.setZero();
             }
             static int dbg_tick2 = 0;
             // if ((dbg_tick2++ % 20) == 0)
@@ -2244,7 +2346,8 @@ void CustomController::computeSlow()
                     }
                     test_act_mapped_file_ << "\n";
                 }
-                if (test_action_rate_stats_file_ && test_policy_step_ >= 200 && test_policy_step_ <= 2200)
+                if (test_action_rate_stats_file_ && mode7_policy_ran_this_tick &&
+                    test_policy_step_ >= 200 && test_policy_step_ <= 2200)
                 {
                     test_action_rate_stats_file_ << test_policy_step_ << ","
                                                  << test_action_rate_stats_last_mean_abs_ << ","
@@ -2285,14 +2388,50 @@ void CustomController::computeSlow()
             time_inference_pre_ = rd_cc_.control_time_us_;
         }
 
+        const size_t required_hist_len = get_required_leg_hist_len();
+        const bool hist_ready_for_control = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
+        if (!hist_ready_for_control)
+        {
+            const auto &vel_src = use_dtau_joint_vel_lpf_ ? q_dot_lpf_ : q_vel_noise_;
+            rd_.q_desired = q_init_;
+            torque_rl_ = kp_ * (q_init_ - q_noise_) - kv_ * vel_src;
+
+            if (rd_cc_.control_time_us_ < start_time_ + 0.1e6)
+            {
+                for (int i = 0; i < MODEL_DOF; i++)
+                {
+                    torque_spline_(i) = DyrosMath::cubic(rd_cc_.control_time_us_,
+                                                        start_time_,
+                                                        start_time_ + 0.1e6,
+                                                        torque_init_(i),
+                                                        torque_rl_(i),
+                                                        0.0,
+                                                        0.0);
+                }
+                rd_.torque_desired = torque_spline_;
+            }
+            else
+            {
+                rd_.torque_desired = torque_rl_;
+            }
+
+            for (int i = 0; i < MODEL_DOF; i++)
+            {
+                rd_.torque_desired(i) = DyrosMath::minmax_cut(
+                    rd_.torque_desired(i), -torque_bound_(i), torque_bound_(i));
+            }
+            prev_tc_mode_ = tc_mode;
+            return;
+        }
+
         Vector12d target_pos;
         Eigen::Matrix<double, num_arm_action, 1> target_pos_arm;
         static int target_log_counter = 0;
         for (int i = 0; i < num_actuator_action; i++)
         {
             double a = DyrosMath::minmax_cut(rl_action_(i), -1.0, 1.0);
-            const double lo = kLegJointPosLimits[i][0] * q_limit_scale_;
-            const double hi = kLegJointPosLimits[i][1] * q_limit_scale_;
+            const double lo = leg_joint_pos_limits_[i][0] * q_limit_scale_;
+            const double hi = leg_joint_pos_limits_[i][1] * q_limit_scale_;
             double target = 0.5 * (a + 1.0) * (hi - lo) + lo;
             if (has_joint_limits_)
             {
@@ -2313,8 +2452,8 @@ void CustomController::computeSlow()
             {
                 const int joint_idx = kArmJointMapAction[i];
                 double a = DyrosMath::minmax_cut(rl_action_arm_(i), -1.0, 1.0);
-                const double lo = kArmJointPosLimits[i][0] * q_limit_scale_;
-                const double hi = kArmJointPosLimits[i][1] * q_limit_scale_;
+                const double lo = arm_joint_pos_limits_[i][0] * q_limit_scale_;
+                const double hi = arm_joint_pos_limits_[i][1] * q_limit_scale_;
                 double target = 0.5 * (a + 1.0) * (hi - lo) + lo;
                 if (has_joint_limits_)
                 {
