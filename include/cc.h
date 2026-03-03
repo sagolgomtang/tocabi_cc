@@ -16,6 +16,7 @@
 #include "onnxruntime_cxx_api.h"
 #include <urdf/model.h>
 #include <array>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -39,12 +40,15 @@ public:
     RobotData rd_cc_;
 
     void loadOnnX();
+    void loadArmOnnX();
     void loadJointLimits();
     void loadCasadiCMM();
     void processNoise();
     void processObservation();
+    void processArmObservation();
     void processDiscriminator();
     void feedforwardPolicy();
+    void feedforwardArmPolicy();
     void initVariable();
     void publishCommandMarker();
     void publishCommandVector();
@@ -69,10 +73,21 @@ public:
     std::vector<float> state_long_hist_, state_long_hist_buffer_;
 
     int input_obs_idx_ = 0;
+    int arm_input_obs_idx_ = 0;
+
+    // Arm policy ONNX
+    Ort::Session arm_session;
+    size_t arm_input_number = 0, arm_output_number = 0;
+    std::vector<std::string> arm_input_names, arm_output_names;
+    std::vector<const char *> arm_input_names_char, arm_output_names_char;
+    std::vector<Ort::Value> arm_input_tensors, arm_output_tensors;
+    std::vector<std::vector<float>> arm_input_states_buffer;
+    std::vector<float> arm_state_cur_, arm_state_buffer_;
 
     ///////////////////////////////////// Actor-Critic Network ///////////////////////////////////////
     static const int num_action = 12;
     static const int num_actuator_action = 12;
+    static const int num_arm_action = 8;
     // static const int num_cur_state = 49; // 37 + 12
     // LegActor obs: internal state excludes last_action (num_action).
     static const int num_cur_state = 50;
@@ -89,8 +104,11 @@ public:
     static const int num_long_hist_len = 50;
     static const int num_hist_state = num_long_hist_len * num_long_hist_skip;
 
+    // ArmActor obs: 3(base ang vel) + 3(gravity) + 8(q) + 8(qdot) + 8(last) + 3(CAM) + 3(CAM_des)
+    static const int num_arm_state = 36;
 
     Eigen::MatrixXd rl_action_, rl_action_pre_, torq_diff_, energy;
+    Eigen::Matrix<double, num_arm_action, 1> rl_action_arm_, rl_action_arm_pre_;
     double value_;
     ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -139,8 +157,13 @@ public:
     // float ft_right_init_ = 500.0;
 
     string weight_dir_ = "";
+    string arm_weight_dir_ = "";
     bool use_arm_policy_ = false;
     bool include_cam_obs_ = true;
+    bool use_obs_history_layout_ = false;
+    bool use_obs_joint_vel_lpf_ = true;
+    bool use_dtau_joint_vel_lpf_ = true;
+    bool obs_history_layout_warned_ = false;
     std::string policy_with_arm_path_;
     std::string policy_without_arm_path_;
     // Joystick
@@ -172,6 +195,8 @@ public:
     double cmd_vis_scale_ = 1.0;
 
     Eigen::Vector3d local_lin_vel_;
+    Eigen::Vector3d cam_bf_;
+    Eigen::Vector3d cam_des_bf_;
 
     Eigen::Matrix<double, 12, 12> action_offset_, 
                                   action_scale_;
@@ -198,6 +223,7 @@ public:
     double cmd_scale_yaw_ = 0.6;
 
     Eigen::Matrix<double, num_action, 1> action_rate_;
+    std::deque<std::vector<float>> leg_hist_core_queue_;
 
     bool pace_trigger_ = false;
     bool pace_active_ = false;
@@ -239,6 +265,11 @@ public:
     bool use_casadi_cam_ = false;
     std::string casadi_cmm_path_;
 #ifdef TOCABI_CC_USE_CASADI
+    bool casadi_cam_ready_ = false;
+#else
+    bool casadi_cam_ready_ = false;
+#endif
+#ifdef TOCABI_CC_USE_CASADI
     casadi::Function cmm_fn_;
     bool casadi_cam_ready_ = false;
 #endif
@@ -251,19 +282,25 @@ public:
     bool mode6_logged_ = false;
     bool mode7_send_triggered_ = false;
     size_t test_log_step_ = 0;
+    size_t test_policy_step_ = 0;
     std::string test_log_dir_ = "/home/user/tocabi_mujoco_ws/src/tocabi_cc/test_log";
     std::ofstream test_obs_file_;
     std::ofstream test_act_file_;
     std::ofstream test_act_mapped_file_;
+    std::ofstream test_action_rate_stats_file_;
     std::vector<Eigen::Matrix<double, 12, 1>> test_act_buffer_;
-    std::string test_act_runtime_name_ = "leg_actions_sim.txt";
-    std::string test_act_mapped_name_ = "leg_actions_sim_mapped.txt";
+    std::string test_act_runtime_name_ = "leg_actions_sim.csv";
+    std::string test_act_mapped_name_ = "leg_actions_sim_mapped.csv";
+    std::string test_action_rate_stats_name_ = "action_rate_stats_sim.csv";
+    bool test_action_rate_stats_last_valid_ = false;
+    double test_action_rate_stats_last_mean_abs_ = 0.0;
+    double test_action_rate_stats_last_max_abs_ = 0.0;
     std::string test_obs_input_name_ = "leg_actor_obs.txt";
     std::vector<std::vector<float>> test_obs_buffer_;
     size_t test_obs_idx_ = 0;
     size_t test_max_steps_ = 0;
     std::ofstream test_obs_sim_file_;
-    std::string test_obs_sim_name_ = "leg_actor_obs_sim.txt";
+    std::string test_obs_sim_name_ = "leg_actor_obs_sim.csv";
     size_t test_obs_sim_step_ = 0;
     bool test_obs_sim_done_ = false;
     size_t test_obs_sim_max_steps_ = 1000;
