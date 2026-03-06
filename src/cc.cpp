@@ -549,37 +549,37 @@ void CustomController::loadCasadiCMM()
         return;
     }
 
-#ifdef TOCABI_CC_USE_CASADI
-    if (casadi_cmm_path_.empty())
-    {
-        ROS_WARN("use_casadi_cam is true but casadi_cmm_path is empty. Disabling CasADi CAM.");
-        use_casadi_cam_ = false;
-        return;
-    }
-    if (!std::filesystem::exists(casadi_cmm_path_))
-    {
-        ROS_WARN_STREAM("CasADi CMM file not found: " << casadi_cmm_path_
-                                                      << ". Disabling CasADi CAM.");
-        use_casadi_cam_ = false;
-        return;
-    }
-    try
-    {
-        cmm_fn_ = casadi::Function::load(casadi_cmm_path_);
-        casadi_cam_ready_ = true;
-        ROS_INFO_STREAM("Loaded CasADi CMM function: " << casadi_cmm_path_);
-    }
-    catch (const std::exception &e)
-    {
-        ROS_WARN_STREAM("Failed to load CasADi CMM (" << casadi_cmm_path_ << "): " << e.what()
-                                                      << ". Disabling CasADi CAM.");
-        use_casadi_cam_ = false;
-        casadi_cam_ready_ = false;
-    }
-#else
-    ROS_WARN("Built without CasADi support. Disabling CasADi CAM.");
-    use_casadi_cam_ = false;
-#endif
+// #ifdef TOCABI_CC_USE_CASADI
+//     if (casadi_cmm_path_.empty())
+//     {
+//         ROS_WARN("use_casadi_cam is true but casadi_cmm_path is empty. Disabling CasADi CAM.");
+//         use_casadi_cam_ = false;
+//         return;
+//     }
+//     if (!std::filesystem::exists(casadi_cmm_path_))
+//     {
+//         ROS_WARN_STREAM("CasADi CMM file not found: " << casadi_cmm_path_
+//                                                       << ". Disabling CasADi CAM.");
+//         use_casadi_cam_ = false;
+//         return;
+//     }
+//     try
+//     {
+//         cmm_fn_ = casadi::Function::load(casadi_cmm_path_);
+//         casadi_cam_ready_ = true;
+//         ROS_INFO_STREAM("Loaded CasADi CMM function: " << casadi_cmm_path_);
+//     }
+//     catch (const std::exception &e)
+//     {
+//         ROS_WARN_STREAM("Failed to load CasADi CMM (" << casadi_cmm_path_ << "): " << e.what()
+//                                                       << ". Disabling CasADi CAM.");
+//         use_casadi_cam_ = false;
+//         casadi_cam_ready_ = false;
+//     }
+// #else
+//     ROS_WARN("Built without CasADi support. Disabling CasADi CAM.");
+//     use_casadi_cam_ = false;
+// #endif
 }
 
 
@@ -1077,49 +1077,49 @@ void CustomController::processObservation()
     {
         Eigen::Vector6d cm = rd_cc_.CMM * rd_cc_.q_dot_virtual_;
         Eigen::Vector6d cm_des = Eigen::Vector6d::Zero();
-#ifdef TOCABI_CC_USE_CASADI
-        if (use_casadi_cam_ && casadi_cam_ready_)
-        {
-            try
-            {
-                std::vector<double> q_vec(MODEL_DOF_QVIRTUAL);
-                std::vector<double> qdot_vec(MODEL_DOF_VIRTUAL);
-                for (int i = 0; i < MODEL_DOF_QVIRTUAL; ++i)
-                {
-                    q_vec[i] = rd_cc_.q_virtual_(i);
-                }
-                for (int i = 0; i < MODEL_DOF_VIRTUAL; ++i)
-                {
-                    qdot_vec[i] = rd_cc_.q_dot_virtual_(i);
-                }
-                casadi::DM q_dm(q_vec);
-                casadi::DM qdot_dm(qdot_vec);
-                std::vector<casadi::DM> out = cmm_fn_(std::vector<casadi::DM>{q_dm});
-                if (!out.empty())
-                {
-                    casadi::DM cmm_dm = out[0];
-                    casadi::DM cm_dm = casadi::mtimes(cmm_dm, qdot_dm);
-                    for (int i = 0; i < 6; ++i)
-                    {
-                        cm(i) = static_cast<double>(cm_dm(i));
-                    }
-                    casadi::DM vdes_dm = casadi::DM::zeros(qdot_dm.size1(), qdot_dm.size2());
-                    vdes_dm(0) = target_vel_x_;
-                    vdes_dm(1) = target_vel_y_;
-                    vdes_dm(5) = target_vel_yaw_;
-                    casadi::DM cm_des_dm = casadi::mtimes(cmm_dm, vdes_dm);
-                    for (int i = 0; i < 6; ++i)
-                    {
-                        cm_des(i) = static_cast<double>(cm_des_dm(i));
-                    }
-                }
-            }
-            catch (const std::exception &e)
-            {
-                ROS_WARN_STREAM_THROTTLE(1.0, "CasADi CAM eval failed: " << e.what());
-            }
-        }
-#endif
+// #ifdef TOCABI_CC_USE_CASADI
+//         if (use_casadi_cam_ && casadi_cam_ready_)
+//         {
+//             try
+//             {
+//                 std::vector<double> q_vec(MODEL_DOF_QVIRTUAL);
+//                 std::vector<double> qdot_vec(MODEL_DOF_VIRTUAL);
+//                 for (int i = 0; i < MODEL_DOF_QVIRTUAL; ++i)
+//                 {
+//                     q_vec[i] = rd_cc_.q_virtual_(i);
+//                 }
+//                 for (int i = 0; i < MODEL_DOF_VIRTUAL; ++i)
+//                 {
+//                     qdot_vec[i] = rd_cc_.q_dot_virtual_(i);
+//                 }
+//                 casadi::DM q_dm(q_vec);
+//                 casadi::DM qdot_dm(qdot_vec);
+//                 std::vector<casadi::DM> out = cmm_fn_(std::vector<casadi::DM>{q_dm});
+//                 if (!out.empty())
+//                 {
+//                     casadi::DM cmm_dm = out[0];
+//                     casadi::DM cm_dm = casadi::mtimes(cmm_dm, qdot_dm);
+//                     for (int i = 0; i < 6; ++i)
+//                     {
+//                         cm(i) = static_cast<double>(cm_dm(i));
+//                     }
+//                     casadi::DM vdes_dm = casadi::DM::zeros(qdot_dm.size1(), qdot_dm.size2());
+//                     vdes_dm(0) = target_vel_x_;
+//                     vdes_dm(1) = target_vel_y_;
+//                     vdes_dm(5) = target_vel_yaw_;
+//                     casadi::DM cm_des_dm = casadi::mtimes(cmm_dm, vdes_dm);
+//                     for (int i = 0; i < 6; ++i)
+//                     {
+//                         cm_des(i) = static_cast<double>(cm_des_dm(i));
+//                     }
+//                 }
+//             }
+//             catch (const std::exception &e)
+//             {
+//                 ROS_WARN_STREAM_THROTTLE(1.0, "CasADi CAM eval failed: " << e.what());
+//             }
+//         }
+// #endif
         if (!use_casadi_cam_ || !casadi_cam_ready_)
         {
             Eigen::VectorXd vdes = Eigen::VectorXd::Zero(MODEL_DOF_VIRTUAL);
@@ -1152,17 +1152,17 @@ void CustomController::processObservation()
         Eigen::Vector3d base_ang_vel_truth = Eigen::Vector3d::Zero();
         Eigen::Vector3d gravity_truth = Eigen::Vector3d::Zero();
         double yaw_truth = 0.0;
-        if (rd_cc_.q_virtual_local_.size() >= MODEL_DOF_QVIRTUAL &&
-            rd_cc_.q_dot_virtual_local_.size() >= MODEL_DOF_VIRTUAL)
+        if (rd_cc_.q_virtual_.size() >= MODEL_DOF_QVIRTUAL &&
+            rd_cc_.q_dot_virtual_lpf.size() >= MODEL_DOF_VIRTUAL)
         {
             Eigen::Quaterniond q_truth;
-            q_truth.x() = rd_cc_.q_virtual_local_(3);
-            q_truth.y() = rd_cc_.q_virtual_local_(4);
-            q_truth.z() = rd_cc_.q_virtual_local_(5);
-            q_truth.w() = rd_cc_.q_virtual_local_(MODEL_DOF_QVIRTUAL - 1);
+            q_truth.x() = rd_cc_.q_virtual_(3);
+            q_truth.y() = rd_cc_.q_virtual_(4);
+            q_truth.z() = rd_cc_.q_virtual_(5);
+            q_truth.w() = rd_cc_.q_virtual_(MODEL_DOF_QVIRTUAL - 1);
             yaw_truth = DyrosMath::rot2Euler_tf(q_truth.toRotationMatrix())(2);
-            base_lin_vel_truth = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_local_.segment(0, 3));
-            base_ang_vel_truth = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_local_.segment(3, 3));
+            base_lin_vel_truth = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_lpf.segment(0, 3));
+            base_ang_vel_truth = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_lpf.segment(3, 3));
             gravity_truth = quatRotateInverse(q_truth, Eigen::Vector3d(0.0, 0.0, -1.0));
         }
         se_log_file_ << se_log_step_++ << "\t"
@@ -1176,6 +1176,37 @@ void CustomController::processObservation()
                      << gravity_truth(0) << "\t" << gravity_truth(1) << "\t" << gravity_truth(2)
                      << "\n";
     }
+
+    // if (se_log_active_ && se_log_file_.is_open())
+    // {
+    //     Eigen::Vector3d base_lin_vel_truth = Eigen::Vector3d::Zero();
+    //     Eigen::Vector3d base_ang_vel_truth = Eigen::Vector3d::Zero();
+    //     Eigen::Vector3d gravity_truth = Eigen::Vector3d::Zero();
+    //     double yaw_truth = 0.0;
+    //     if (rd_cc_.q_virtual_local_.size() >= MODEL_DOF_QVIRTUAL &&
+    //         rd_cc_.q_dot_virtual_local_.size() >= MODEL_DOF_VIRTUAL)
+    //     {
+    //         Eigen::Quaterniond q_truth;
+    //         q_truth.x() = rd_cc_.q_virtual_local_(3);
+    //         q_truth.y() = rd_cc_.q_virtual_local_(4);
+    //         q_truth.z() = rd_cc_.q_virtual_local_(5);
+    //         q_truth.w() = rd_cc_.q_virtual_local_(MODEL_DOF_QVIRTUAL - 1);
+    //         yaw_truth = DyrosMath::rot2Euler_tf(q_truth.toRotationMatrix())(2);
+    //         base_lin_vel_truth = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_local_.segment(0, 3));
+    //         base_ang_vel_truth = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_local_.segment(3, 3));
+    //         gravity_truth = quatRotateInverse(q_truth, Eigen::Vector3d(0.0, 0.0, -1.0));
+    //     }
+    //     se_log_file_ << se_log_step_++ << "\t"
+    //                  << base_lin_vel_bf(0) << "\t" << base_lin_vel_bf(1) << "\t" << base_lin_vel_bf(2) << "\t"
+    //                  << euler_angle_(2) << "\t"
+    //                  << base_ang_vel_bf(0) << "\t" << base_ang_vel_bf(1) << "\t" << base_ang_vel_bf(2) << "\t"
+    //                  << gravity_bf(0) << "\t" << gravity_bf(1) << "\t" << gravity_bf(2) << "\t"
+    //                  << base_lin_vel_truth(0) << "\t" << base_lin_vel_truth(1) << "\t" << base_lin_vel_truth(2) << "\t"
+    //                  << yaw_truth << "\t"
+    //                  << base_ang_vel_truth(0) << "\t" << base_ang_vel_truth(1) << "\t" << base_ang_vel_truth(2) << "\t"
+    //                  << gravity_truth(0) << "\t" << gravity_truth(1) << "\t" << gravity_truth(2)
+    //                  << "\n";
+    // }
 
     for (int i = data_idx; i < num_cur_state; ++i)
     {
