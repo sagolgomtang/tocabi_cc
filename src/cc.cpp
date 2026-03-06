@@ -7,7 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#include <xmlrpcpp/XmlRpcValue.h>
+#include <yaml-cpp/yaml.h>
 
 using namespace TOCABI;
 
@@ -57,28 +57,23 @@ constexpr std::array<std::array<double, 2>, CustomController::num_arm_action> kA
 }};
 
 template <size_t N>
-bool loadLimits2DParam(ros::NodeHandle &nh, const std::string &name, std::array<std::array<double, 2>, N> &out)
+bool loadLimits2DYaml(const YAML::Node &cfg, const char *key, std::array<std::array<double, 2>, N> &out)
 {
-    XmlRpc::XmlRpcValue v;
-    if (!nh.getParam(name, v))
+    const YAML::Node n = cfg[key];
+    if (!n || !n.IsSequence() || n.size() != N)
     {
-        return false;
-    }
-    if (v.getType() != XmlRpc::XmlRpcValue::TypeArray || v.size() != static_cast<int>(N))
-    {
-        ROS_WARN_STREAM(name << " must be an array with " << N << " entries.");
         return false;
     }
     for (size_t i = 0; i < N; ++i)
     {
-        if (v[static_cast<int>(i)].getType() != XmlRpc::XmlRpcValue::TypeArray ||
-            v[static_cast<int>(i)].size() != 2)
+        const YAML::Node lim = n[i];
+        if (!lim.IsSequence() || lim.size() != 2)
         {
-            ROS_WARN_STREAM(name << "[" << i << "] must be [min, max].");
+            ROS_WARN_STREAM("[YAML] " << key << "[" << i << "] must be [min, max].");
             return false;
         }
-        out[i][0] = static_cast<double>(v[static_cast<int>(i)][0]);
-        out[i][1] = static_cast<double>(v[static_cast<int>(i)][1]);
+        out[i][0] = lim[0].as<double>();
+        out[i][1] = lim[1].as<double>();
     }
     return true;
 }
@@ -221,13 +216,58 @@ CustomController::CustomController(RobotData &rd)
 {    
     ControlVal_.setZero();
 
-    nh_.param("/tocabi_cc/use_arm_policy", use_arm_policy_, false);
-    nh_.param<std::string>("/tocabi_cc/policy_with_arm", policy_with_arm_path_, std::string(""));
-    nh_.param<std::string>("/tocabi_cc/policy_without_arm", policy_without_arm_path_, std::string(""));
-    nh_.param("/tocabi_cc/include_cam_obs", include_cam_obs_, use_arm_policy_);
-    nh_.param("/tocabi_cc/use_obs_history_layout", use_obs_history_layout_, false);
-    nh_.param("/tocabi_cc/use_obs_joint_vel_lpf", use_obs_joint_vel_lpf_, true);
-    nh_.param("/tocabi_cc/use_dtau_joint_vel_lpf", use_dtau_joint_vel_lpf_, true);
+    const std::string pkg_path = ros::package::getPath("tocabi_cc");
+    if (pkg_path.empty())
+    {
+        ROS_ERROR("tocabi_cc package path not found. Check your ROS setup.");
+    }
+
+    YAML::Node cc_cfg;
+    const std::string cc_cfg_path = pkg_path + "/src/cc_params.yaml";
+    try
+    {
+        YAML::Node root = YAML::LoadFile(cc_cfg_path);
+        cc_cfg = root["tocabi_cc"];
+        if (!cc_cfg || !cc_cfg.IsMap())
+        {
+            ROS_WARN_STREAM("[YAML] 'tocabi_cc' section not found in " << cc_cfg_path << ". Using defaults.");
+            cc_cfg.reset();
+        }
+    }
+    catch (const std::exception &e)
+    {
+        ROS_WARN_STREAM("[YAML] Failed to load " << cc_cfg_path << ": " << e.what() << ". Using defaults.");
+    }
+
+    include_cam_obs_ = use_arm_policy_;
+    if (cc_cfg)
+    {
+        if (cc_cfg["use_arm_policy"]) use_arm_policy_ = cc_cfg["use_arm_policy"].as<bool>();
+        if (cc_cfg["policy_with_arm"]) policy_with_arm_path_ = cc_cfg["policy_with_arm"].as<std::string>();
+        if (cc_cfg["policy_without_arm"]) policy_without_arm_path_ = cc_cfg["policy_without_arm"].as<std::string>();
+        if (cc_cfg["include_cam_obs"]) include_cam_obs_ = cc_cfg["include_cam_obs"].as<bool>();
+        else include_cam_obs_ = use_arm_policy_;
+        if (cc_cfg["use_obs_history_layout"]) use_obs_history_layout_ = cc_cfg["use_obs_history_layout"].as<bool>();
+        if (cc_cfg["use_obs_joint_vel_lpf"]) use_obs_joint_vel_lpf_ = cc_cfg["use_obs_joint_vel_lpf"].as<bool>();
+        if (cc_cfg["use_dtau_joint_vel_lpf"]) use_dtau_joint_vel_lpf_ = cc_cfg["use_dtau_joint_vel_lpf"].as<bool>();
+        if (cc_cfg["policy_hz"]) policy_hz_ = cc_cfg["policy_hz"].as<double>();
+        if (cc_cfg["phase_period"]) phase_period_s_ = cc_cfg["phase_period"].as<double>();
+        if (cc_cfg["phase_offset"]) phase_offset_s_ = cc_cfg["phase_offset"].as<double>();
+        if (cc_cfg["enable_value_stop"]) enable_value_stop_ = cc_cfg["enable_value_stop"].as<bool>();
+        if (cc_cfg["cmd_scale_x"]) cmd_scale_x_ = cc_cfg["cmd_scale_x"].as<double>();
+        if (cc_cfg["cmd_scale_y"]) cmd_scale_y_ = cc_cfg["cmd_scale_y"].as<double>();
+        if (cc_cfg["cmd_scale_yaw"]) cmd_scale_yaw_ = cc_cfg["cmd_scale_yaw"].as<double>();
+        if (cc_cfg["cmd_vis_scale"]) cmd_vis_scale_ = cc_cfg["cmd_vis_scale"].as<double>();
+        if (cc_cfg["q_limit_scale"]) q_limit_scale_ = cc_cfg["q_limit_scale"].as<double>();
+        if (cc_cfg["use_casadi_cam"]) use_casadi_cam_ = cc_cfg["use_casadi_cam"].as<bool>();
+        if (cc_cfg["casadi_cmm_path"]) casadi_cmm_path_ = cc_cfg["casadi_cmm_path"].as<std::string>();
+    }
+
+    if (policy_hz_ <= 0.0)
+    {
+        ROS_WARN_STREAM("[POLICY] Invalid policy_hz=" << policy_hz_ << ", fallback to 50.0");
+        policy_hz_ = 50.0;
+    }
 
     if (use_arm_policy_)
     {
@@ -245,7 +285,7 @@ CustomController::CustomController(RobotData &rd)
     }
     if (weight_dir_.empty())
     {
-        ROS_ERROR_STREAM("[ONNX] Policy path is empty. Set /tocabi_cc/policy_with_arm and /tocabi_cc/policy_without_arm in cc_params.yaml.");
+        ROS_ERROR_STREAM("[ONNX] Policy path is empty. Set policy_with_arm and policy_without_arm in " << cc_cfg_path);
     }
     if (use_arm_policy_)
     {
@@ -265,22 +305,6 @@ CustomController::CustomController(RobotData &rd)
             }
         }
     }
-    nh_.param("/tocabi_cc/phase_period", phase_period_s_, 2.0);
-    // nh_.param("/tocabi_cc/phase_offset", phase_offset_s_, 0.5);
-    nh_.param("/tocabi_cc/phase_offset", phase_offset_s_, 0.0);
-    nh_.param("/tocabi_cc/enable_value_stop", enable_value_stop_, false);
-    nh_.param("/tocabi_cc/cmd_scale_x", cmd_scale_x_, 0.5);
-    nh_.param("/tocabi_cc/cmd_scale_y", cmd_scale_y_, 0.2);
-    nh_.param("/tocabi_cc/cmd_scale_yaw", cmd_scale_yaw_, 0.6);
-    nh_.param("/tocabi_cc/cmd_vis_scale", cmd_vis_scale_, 1.0);
-    nh_.param("/tocabi_cc/q_limit_scale", q_limit_scale_, 1.0);
-
-    const std::string pkg_path = ros::package::getPath("tocabi_cc");
-    if (pkg_path.empty())
-    {
-        ROS_ERROR("tocabi_cc package path not found. Check your ROS setup.");
-    }
-    
     if (is_write_file_)
     {
         std::string file_tag = weight_dir_;
@@ -298,30 +322,62 @@ CustomController::CustomController(RobotData &rd)
         writeFile << std::fixed << std::setprecision(8);
     }
     initVariable();
+    if (cc_cfg)
+    {
+        std::vector<double> vec_param;
+        auto load_vec = [&](const char *key, std::vector<double> &out) -> bool {
+            const YAML::Node n = cc_cfg[key];
+            if (!n || !n.IsSequence())
+            {
+                return false;
+            }
+            out.clear();
+            out.reserve(n.size());
+            for (size_t i = 0; i < n.size(); ++i)
+            {
+                out.push_back(n[i].as<double>());
+            }
+            return true;
+        };
+
+        if (load_vec("torque_bound", vec_param) && vec_param.size() == static_cast<size_t>(MODEL_DOF))
+        {
+            for (int i = 0; i < MODEL_DOF; ++i) torque_bound_(i) = vec_param[i];
+        }
+        if (load_vec("q_init", vec_param) && vec_param.size() == static_cast<size_t>(MODEL_DOF))
+        {
+            for (int i = 0; i < MODEL_DOF; ++i) q_init_(i) = vec_param[i];
+            q_init_mode7_ = q_init_;
+            pace_hold_q_ = q_init_;
+            for (int i = 0; i < num_actuator_action; ++i)
+            {
+                action_offset_(i, i) = q_init_(kLegJointMapAction[i]);
+            }
+        }
+        if (load_vec("kp_diag", vec_param) && vec_param.size() == static_cast<size_t>(MODEL_DOF))
+        {
+            for (int i = 0; i < MODEL_DOF; ++i) kp_(i, i) = vec_param[i];
+        }
+        if (load_vec("kv_diag", vec_param) && vec_param.size() == static_cast<size_t>(MODEL_DOF))
+        {
+            for (int i = 0; i < MODEL_DOF; ++i) kv_(i, i) = vec_param[i];
+        }
+        loadLimits2DYaml(cc_cfg, "leg_joint_pos_limits", leg_joint_pos_limits_);
+        loadLimits2DYaml(cc_cfg, "arm_joint_pos_limits", arm_joint_pos_limits_);
+        if (load_vec("action_scale", vec_param) && vec_param.size() == static_cast<size_t>(num_actuator_action))
+        {
+            for (int i = 0; i < num_actuator_action; ++i) action_scale_(i, i) = vec_param[i];
+        }
+        if (load_vec("action_offset", vec_param) && vec_param.size() == static_cast<size_t>(num_actuator_action))
+        {
+            for (int i = 0; i < num_actuator_action; ++i) action_offset_(i, i) = vec_param[i];
+        }
+    }
     loadJointLimits();
     loadCasadiCMM();
     {
         std::ofstream clear_file(test_log_dir_ + "/" + test_action_rate_stats_name_,
                                  std::ofstream::out | std::ofstream::trunc);
-    }
-    // Override action mapping if provided
-    std::vector<double> action_scale_param;
-    if (nh_.getParam("/tocabi_cc/action_scale", action_scale_param) &&
-        action_scale_param.size() == static_cast<size_t>(num_actuator_action))
-    {
-        for (int i = 0; i < num_actuator_action; i++)
-        {
-            action_scale_(i, i) = action_scale_param[i];
-        }
-    }
-    std::vector<double> action_offset_param;
-    if (nh_.getParam("/tocabi_cc/action_offset", action_offset_param) &&
-        action_offset_param.size() == static_cast<size_t>(num_actuator_action))
-    {
-        for (int i = 0; i < num_actuator_action; i++)
-        {
-            action_offset_(i, i) = action_offset_param[i];
-        }
     }
     loadOnnX();
     if (use_arm_policy_)
@@ -374,6 +430,9 @@ void CustomController::initVariable()
     }
 
     q_dot_lpf_.setZero();
+    base_ang_vel_bf_lpf_.setZero();
+    base_ang_vel_lpf_initialized_ = false;
+    base_ang_vel_lpf_last_us_ = 0;
 
     leg_joint_pos_limits_ = kLegJointPosLimits;
     arm_joint_pos_limits_ = kArmJointPosLimits;
@@ -418,32 +477,6 @@ void CustomController::initVariable()
                         10.0, 28.0, 10.0, 10.0, 10.0, 10.0, 3.0, 3.0,
                         2.0, 2.0,
                         10.0, 28.0, 10.0, 10.0, 10.0, 10.0, 3.0, 3.0;
-
-    std::vector<double> vec_param;
-    if (nh_.getParam("/tocabi_cc/torque_bound", vec_param) &&
-        vec_param.size() == static_cast<size_t>(MODEL_DOF))
-    {
-        for (int i = 0; i < MODEL_DOF; ++i) torque_bound_(i) = vec_param[i];
-    }
-    if (nh_.getParam("/tocabi_cc/q_init", vec_param) &&
-        vec_param.size() == static_cast<size_t>(MODEL_DOF))
-    {
-        for (int i = 0; i < MODEL_DOF; ++i) q_init_(i) = vec_param[i];
-        q_init_mode7_ = q_init_;
-        pace_hold_q_ = q_init_;
-    }
-    if (nh_.getParam("/tocabi_cc/kp_diag", vec_param) &&
-        vec_param.size() == static_cast<size_t>(MODEL_DOF))
-    {
-        for (int i = 0; i < MODEL_DOF; ++i) kp_(i, i) = vec_param[i];
-    }
-    if (nh_.getParam("/tocabi_cc/kv_diag", vec_param) &&
-        vec_param.size() == static_cast<size_t>(MODEL_DOF))
-    {
-        for (int i = 0; i < MODEL_DOF; ++i) kv_(i, i) = vec_param[i];
-    }
-    loadLimits2DParam(nh_, "/tocabi_cc/leg_joint_pos_limits", leg_joint_pos_limits_);
-    loadLimits2DParam(nh_, "/tocabi_cc/arm_joint_pos_limits", arm_joint_pos_limits_);
 
     action_offset_.setZero();
     action_scale_.setIdentity();
@@ -511,9 +544,6 @@ void CustomController::loadJointLimits()
 
 void CustomController::loadCasadiCMM()
 {
-    nh_.param("/tocabi_cc/use_casadi_cam", use_casadi_cam_, false);
-    nh_.getParam("/tocabi_cc/casadi_cmm_path", casadi_cmm_path_);
-
     if (!use_casadi_cam_)
     {
         return;
@@ -522,7 +552,7 @@ void CustomController::loadCasadiCMM()
 #ifdef TOCABI_CC_USE_CASADI
     if (casadi_cmm_path_.empty())
     {
-        ROS_WARN("use_casadi_cam is true but /tocabi_cc/casadi_cmm_path is empty. Disabling CasADi CAM.");
+        ROS_WARN("use_casadi_cam is true but casadi_cmm_path is empty. Disabling CasADi CAM.");
         use_casadi_cam_ = false;
         return;
     }
@@ -871,12 +901,27 @@ void CustomController::processObservation()
     {
         base_ang_vel_bf = quatRotateInverse(q, rd_cc_.q_dot_virtual_.segment(3, 3));
     }
-    state_cur_[data_idx++] = base_ang_vel_bf(0);
-    state_cur_[data_idx++] = base_ang_vel_bf(1);
-    state_cur_[data_idx++] = base_ang_vel_bf(2);
-    base_ang_cur[0] = static_cast<float>(base_ang_vel_bf(0));
-    base_ang_cur[1] = static_cast<float>(base_ang_vel_bf(1));
-    base_ang_cur[2] = static_cast<float>(base_ang_vel_bf(2));
+    if (!base_ang_vel_lpf_initialized_)
+    {
+        base_ang_vel_bf_lpf_ = base_ang_vel_bf;
+        base_ang_vel_lpf_initialized_ = true;
+    }
+    const double dt_base_ang = (base_ang_vel_lpf_last_us_ > 0)
+                                   ? (rd_cc_.control_time_us_ - base_ang_vel_lpf_last_us_) / 1.0e6
+                                   : 0.0;
+    if (dt_base_ang > 0.0)
+    {
+        base_ang_vel_bf_lpf_ =
+            DyrosMath::lpf<3>(base_ang_vel_bf, base_ang_vel_bf_lpf_, 1.0 / dt_base_ang, 60.0);
+    }
+    base_ang_vel_lpf_last_us_ = rd_cc_.control_time_us_;
+
+    state_cur_[data_idx++] = base_ang_vel_bf_lpf_(0);
+    state_cur_[data_idx++] = base_ang_vel_bf_lpf_(1);
+    state_cur_[data_idx++] = base_ang_vel_bf_lpf_(2);
+    base_ang_cur[0] = static_cast<float>(base_ang_vel_bf_lpf_(0));
+    base_ang_cur[1] = static_cast<float>(base_ang_vel_bf_lpf_(1));
+    base_ang_cur[2] = static_cast<float>(base_ang_vel_bf_lpf_(2));
 
     // projected_gravity (body frame)
     Eigen::Vector3d gravity_bf = quatRotateInverse(q, Eigen::Vector3d(0.0, 0.0, -1.0));
@@ -1328,9 +1373,10 @@ void CustomController::processArmObservation()
     {
         base_ang_vel_bf = quatRotateInverse(q, rd_cc_.q_dot_virtual_.segment(3, 3));
     }
-    arm_state_cur_[data_idx++] = base_ang_vel_bf(0);
-    arm_state_cur_[data_idx++] = base_ang_vel_bf(1);
-    arm_state_cur_[data_idx++] = base_ang_vel_bf(2);
+    // Reuse the same filtered base angular velocity used by leg observation.
+    arm_state_cur_[data_idx++] = base_ang_vel_bf_lpf_(0);
+    arm_state_cur_[data_idx++] = base_ang_vel_bf_lpf_(1);
+    arm_state_cur_[data_idx++] = base_ang_vel_bf_lpf_(2);
 
     // projected_gravity (body frame)
     Eigen::Vector3d gravity_bf = quatRotateInverse(q, Eigen::Vector3d(0.0, 0.0, -1.0));
@@ -1597,6 +1643,42 @@ void CustomController::computeSlow()
         }
         test_action_rate_stats_file_.flush();
     };
+    auto update_action_rate_time_avg = [this]() {
+        double mean_abs = 0.0;
+        double max_abs = 0.0;
+        for (int i = 0; i < num_action; i++)
+        {
+            const double av = std::abs(action_rate_(i));
+            mean_abs += av;
+            if (av > max_abs)
+            {
+                max_abs = av;
+            }
+        }
+        mean_abs /= static_cast<double>(num_action);
+
+        test_action_rate_stats_last_mean_abs_ = mean_abs;
+        test_action_rate_stats_last_max_abs_ = max_abs;
+        test_action_rate_stats_last_valid_ = true;
+
+        action_rate_timeavg_sum_mean_ += mean_abs;
+        action_rate_timeavg_sum_max_ += max_abs;
+        action_rate_timeavg_count_++;
+
+        if (action_rate_timeavg_count_ >= 1000)
+        {
+            const double mean_wavg = action_rate_timeavg_sum_mean_ /
+                                     static_cast<double>(std::max<size_t>(1, action_rate_timeavg_count_));
+            const double max_wavg = action_rate_timeavg_sum_max_ /
+                                    static_cast<double>(std::max<size_t>(1, action_rate_timeavg_count_));
+            ROS_INFO_STREAM("[ACTION_RATE_WAVG] mean_wavg=" << mean_wavg
+                            << " max_wavg=" << max_wavg
+                            << " window_samples=" << action_rate_timeavg_count_);
+            action_rate_timeavg_sum_mean_ = 0.0;
+            action_rate_timeavg_sum_max_ = 0.0;
+            action_rate_timeavg_count_ = 0;
+        }
+    };
     if ((prev_tc_mode_ == 6 || prev_tc_mode_ == 7) && tc_mode != prev_tc_mode_)
     {
         finalize_action_rate_stats_log();
@@ -1652,6 +1734,10 @@ void CustomController::computeSlow()
             test_log_step_ = 0;
             test_policy_step_ = 0;
             test_action_rate_stats_last_valid_ = false;
+            action_rate_timeavg_sum_mean_ = 0.0;
+            action_rate_timeavg_sum_max_ = 0.0;
+            action_rate_timeavg_count_ = 0;
+            action_rate_timeavg_last_print_us_ = 0;
             leg_hist_core_queue_.clear();
             test_act_buffer_.clear();
             start_time_ = rd_cc_.control_time_us_;
@@ -1664,7 +1750,7 @@ void CustomController::computeSlow()
             q_noise_pre_ = q_noise_ = q_init_mode7_;
             time_cur_ = start_time_ / 1e6;
             time_pre_ = time_cur_ - 0.005;
-            time_inference_pre_ = rd_cc_.control_time_us_ - (1 / 249.9) * 1e6;
+            time_inference_pre_ = rd_cc_.control_time_us_ - (1.0 / policy_hz_) * 1e6;
             torque_init_ = rd_cc_.torque_desired;
             torque_rl_ = torque_init_;
             torque_spline_ = torque_init_;
@@ -1753,7 +1839,7 @@ void CustomController::computeSlow()
         const bool use_logged_obs = true;
         if (!use_logged_obs || test_obs_idx_ < test_obs_buffer_.size())
         {
-            if ((rd_cc_.control_time_us_ - time_inference_pre_) / 1.0e6 >= 1 / 100.0)
+            if ((rd_cc_.control_time_us_ - time_inference_pre_) / 1.0e6 >= 1.0 / policy_hz_)
             {
                 if (use_logged_obs)
                 {
@@ -1778,19 +1864,7 @@ void CustomController::computeSlow()
                 }
                 feedforwardPolicy();
                 test_policy_step_++;
-                {
-                    double mean_abs = 0.0;
-                    double max_abs = 0.0;
-                    for (int i = 0; i < num_action; i++)
-                    {
-                        const double av = std::abs(action_rate_(i));
-                        mean_abs += av;
-                        if (av > max_abs) max_abs = av;
-                    }
-                    test_action_rate_stats_last_mean_abs_ = mean_abs / static_cast<double>(num_action);
-                    test_action_rate_stats_last_max_abs_ = max_abs;
-                    test_action_rate_stats_last_valid_ = true;
-                }
+                update_action_rate_time_avg();
                 if (use_arm_policy_)
                 {
                     processArmObservation();
@@ -2028,6 +2102,10 @@ void CustomController::computeSlow()
             test_log_step_ = 0;
             test_policy_step_ = 0;
             test_action_rate_stats_last_valid_ = false;
+            action_rate_timeavg_sum_mean_ = 0.0;
+            action_rate_timeavg_sum_max_ = 0.0;
+            action_rate_timeavg_count_ = 0;
+            action_rate_timeavg_last_print_us_ = 0;
             leg_hist_core_queue_.clear();
             sim_paused_ = false;
             if (test_act_file_.is_open())
@@ -2098,7 +2176,7 @@ void CustomController::computeSlow()
             q_noise_pre_ = q_noise_ = q_init_mode7_;
             time_cur_ = start_time_ / 1e6;
             time_pre_ = time_cur_ - 0.005;
-            time_inference_pre_ = rd_cc_.control_time_us_ - (1 / 249.9) * 1e6;
+            time_inference_pre_ = rd_cc_.control_time_us_ - (1.0 / policy_hz_) * 1e6;
 
             rd_.tc_init = false;
             ROS_INFO("[CC] mode 7 init");
@@ -2191,19 +2269,7 @@ void CustomController::computeSlow()
             {
                 feedforwardPolicy();
                 test_policy_step_++;
-                {
-                    double mean_abs = 0.0;
-                    double max_abs = 0.0;
-                    for (int i = 0; i < num_action; i++)
-                    {
-                        const double av = std::abs(action_rate_(i));
-                        mean_abs += av;
-                        if (av > max_abs) max_abs = av;
-                    }
-                    test_action_rate_stats_last_mean_abs_ = mean_abs / static_cast<double>(num_action);
-                    test_action_rate_stats_last_max_abs_ = max_abs;
-                    test_action_rate_stats_last_valid_ = true;
-                }
+                update_action_rate_time_avg();
                 if (use_arm_policy_)
                 {
                     processArmObservation();
@@ -2248,7 +2314,7 @@ void CustomController::computeSlow()
         processNoise();
         bool mode7_policy_ran_this_tick = false;
 
-        if ((rd_cc_.control_time_us_ - time_inference_pre_) / 1.0e6 >= 1 / 100.0)
+        if ((rd_cc_.control_time_us_ - time_inference_pre_) / 1.0e6 >= 1.0 / policy_hz_)
         {
             processObservation();
             static int dbg_tick = 0;
@@ -2281,19 +2347,7 @@ void CustomController::computeSlow()
                 feedforwardPolicy();
                 mode7_policy_ran_this_tick = true;
                 test_policy_step_++;
-                {
-                    double mean_abs = 0.0;
-                    double max_abs = 0.0;
-                    for (int i = 0; i < num_action; i++)
-                    {
-                        const double av = std::abs(action_rate_(i));
-                        mean_abs += av;
-                        if (av > max_abs) max_abs = av;
-                    }
-                    test_action_rate_stats_last_mean_abs_ = mean_abs / static_cast<double>(num_action);
-                    test_action_rate_stats_last_max_abs_ = max_abs;
-                    test_action_rate_stats_last_valid_ = true;
-                }
+                update_action_rate_time_avg();
                 if (use_arm_policy_)
                 {
                     processArmObservation();

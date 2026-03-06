@@ -13,6 +13,7 @@ eigen_conversions
 )
 
 find_package(casadi QUIET)
+find_package(yaml-cpp REQUIRED)
 
 catkin_package(
   INCLUDE_DIRS include /usr/local/include/onnxruntime
@@ -48,6 +49,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 target_link_libraries(${PROJECT_NAME} PUBLIC
   ${catkin_LIBRARIES}
   onnxruntime
+  yaml-cpp
 )
 
 if(casadi_FOUND)

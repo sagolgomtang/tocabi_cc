@@ -1,7 +1,7 @@
 tocabi_cc:
   # Policy selection
   use_arm_policy: false
-  policy_without_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/without_arm_hist/2026-03-01_22-01-47_lpf2_model_best_leg.onnx
+  policy_without_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/without_arm_hist/2026-03-05_20-45-09_model_19000_leg.onnx
   policy_with_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/2026-02-19_10-41-28_model_500_leg.onnx
 
   # Observation options
@@ -11,6 +11,7 @@ tocabi_cc:
   use_dtau_joint_vel_lpf: false
 
   # Command/phase options
+  policy_hz: 50.0
   phase_period: 1.6
   phase_offset: 0.5
   cmd_scale_x: 0.25  # max 0.5

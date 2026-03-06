@@ -163,6 +163,7 @@ public:
     bool use_obs_history_layout_ = false;
     bool use_obs_joint_vel_lpf_ = true;
     bool use_dtau_joint_vel_lpf_ = true;
+    double policy_hz_ = 50.0;
     bool obs_history_layout_warned_ = false;
     std::array<std::array<double, 2>, num_actuator_action> leg_joint_pos_limits_;
     std::array<std::array<double, 2>, num_arm_action> arm_joint_pos_limits_;
@@ -197,6 +198,9 @@ public:
     double cmd_vis_scale_ = 1.0;
 
     Eigen::Vector3d local_lin_vel_;
+    Eigen::Vector3d base_ang_vel_bf_lpf_ = Eigen::Vector3d::Zero();
+    bool base_ang_vel_lpf_initialized_ = false;
+    int64_t base_ang_vel_lpf_last_us_ = 0;
     Eigen::Vector3d cam_bf_;
     Eigen::Vector3d cam_des_bf_;
 
@@ -297,6 +301,10 @@ public:
     bool test_action_rate_stats_last_valid_ = false;
     double test_action_rate_stats_last_mean_abs_ = 0.0;
     double test_action_rate_stats_last_max_abs_ = 0.0;
+    double action_rate_timeavg_sum_mean_ = 0.0;
+    double action_rate_timeavg_sum_max_ = 0.0;
+    size_t action_rate_timeavg_count_ = 0;
+    int64_t action_rate_timeavg_last_print_us_ = 0;
     std::string test_obs_input_name_ = "leg_actor_obs.txt";
     std::vector<std::vector<float>> test_obs_buffer_;
     size_t test_obs_idx_ = 0;
