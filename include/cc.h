@@ -174,9 +174,14 @@ public:
 
     void joyCallback(const sensor_msgs::Joy::ConstPtr& joy);
     void xBoxJoyCallback(const sensor_msgs::Joy::ConstPtr& joy);
+    void keyboardCmdCallback(const std_msgs::Float32MultiArray::ConstPtr& msg);
+    void mode7ToggleCallback(const std_msgs::Empty::ConstPtr& msg);
+    void handleMode7ToggleRequest();
     void simTimeCallback(const std_msgs::Float32ConstPtr& msg);
     ros::Subscriber joy_sub_;
     ros::Subscriber xbox_joy_sub_;
+    ros::Subscriber keyboard_cmd_sub_;
+    ros::Subscriber mode7_toggle_sub_;
     ros::Publisher sim_command_pub_;
     ros::Subscriber sim_time_sub_;
     ros::Publisher cmd_marker_pub_;
@@ -184,6 +189,7 @@ public:
     ros::Publisher cam_cmd_pub_;
     ros::Publisher action_rate_pub_;
     ros::Publisher gui_send_pub_;
+    ros::Publisher gui_cmd_pub_;
     ros::Subscriber gui_send_sub_;
     ros::Publisher task_cmd_pub_;
     ros::Publisher pos_cmd_pub_;
@@ -194,6 +200,12 @@ public:
     bool prev_btn8_ = false;
     bool prev_btn2_ = false;
     bool prev_btn3_ = false;
+    bool prev_btn12_ = false;
+    bool btn1_gravity_stopped_ = false;
+    bool cmd_zero_lock_ = false;
+    bool joystick_enabled_ = false;
+    double cmd_stop_min_phase_cycles_ = 0.0;
+    int prev_axis6_dir_ = 0;
     void guiSendCallback(const std_msgs::Empty::ConstPtr& msg);
     double cmd_vis_scale_ = 1.0;
 
@@ -224,6 +236,7 @@ public:
     bool sim_time_received_ = false;
     double sim_time_s_ = 0.0;
     double sim_time_prev_s_ = 0.0;
+    double last_sim_time_observed_s_ = -1.0;
     double cmd_scale_x_ = 1.0;
     double cmd_scale_y_ = 0.5;
     double cmd_scale_yaw_ = 0.6;
@@ -282,6 +295,8 @@ public:
     int debug_log_steps_remaining_ = 0;
     bool debug_log_this_step_ = false;
     bool mode7_active_ = false;
+    bool init_pose_hold_toggle_request_ = false;
+    bool init_pose_hold_active_ = false;
     bool mode6_active_ = false;
     bool mode6_done_ = false;
     int prev_tc_mode_ = -1;

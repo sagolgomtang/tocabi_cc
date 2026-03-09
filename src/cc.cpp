@@ -269,6 +269,11 @@ CustomController::CustomController(RobotData &rd)
         policy_hz_ = 50.0;
     }
 
+    // Keep MuJoCo keyboard command clamp limits aligned with the controller config.
+    ros::param::set("/tocabi_cc/cmd_scale_x", cmd_scale_x_);
+    ros::param::set("/tocabi_cc/cmd_scale_y", cmd_scale_y_);
+    ros::param::set("/tocabi_cc/cmd_scale_yaw", cmd_scale_yaw_);
+
     if (use_arm_policy_)
     {
         if (!policy_with_arm_path_.empty())
@@ -387,6 +392,9 @@ CustomController::CustomController(RobotData &rd)
 
     joy_sub_ = nh_.subscribe<sensor_msgs::Joy>("/joy_gui", 10, &CustomController::joyCallback, this);
     // xbox_joy_sub_ = nh_.subscribe<sensor_msgs::Joy>("/joy", 10, &CustomController::xBoxJoyCallback, this);
+    keyboard_cmd_sub_ = nh_.subscribe<std_msgs::Float32MultiArray>("/mujoco_ros_interface/cmd_vel_keyboard", 10, &CustomController::keyboardCmdCallback, this);
+    mode7_toggle_sub_ = nh_.subscribe<std_msgs::Empty>("/tocabi_cc/mode7_toggle", 10, &CustomController::mode7ToggleCallback, this);
+    ros::param::param("/tocabi_cc/joystick_enabled", joystick_enabled_, false);
     sim_command_pub_ = nh_.advertise<std_msgs::String>("/mujoco_ros_interface/sim_command_con2sim", 1);
     sim_time_sub_ = nh_.subscribe<std_msgs::Float32>("/mujoco_ros_interface/sim_time", 1, &CustomController::simTimeCallback, this);
     cmd_marker_pub_ = nh_.advertise<visualization_msgs::Marker>("/tocabi_cc/cmd_marker", 1);
@@ -394,6 +402,7 @@ CustomController::CustomController(RobotData &rd)
     cam_cmd_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("/tocabi_cc/cam_cmd", 1);
     action_rate_pub_ = nh_.advertise<std_msgs::Float32MultiArray>("/tocabi_cc/action_rate", 1);
     gui_send_pub_ = nh_.advertise<std_msgs::Empty>("/tocabi_gui/send_position_command", 1);
+    gui_cmd_pub_ = nh_.advertise<std_msgs::String>("/tocabi/command", 1);
     gui_send_sub_ = nh_.subscribe<std_msgs::Empty>("/tocabi_gui/send_position_command", 1, &CustomController::guiSendCallback, this);
     task_cmd_pub_ = nh_.advertise<tocabi_msgs::TaskCommand>("/tocabi/taskcommand", 1);
     pos_cmd_pub_ = nh_.advertise<tocabi_msgs::positionCommand>("/tocabi/positioncommand", 1);
@@ -933,6 +942,12 @@ void CustomController::processObservation()
     gravity_cur[2] = static_cast<float>(gravity_bf(2));
 
     // velocity_commands (as-is)
+    if (cmd_zero_lock_)
+    {
+        target_vel_x_ = 0.0;
+        target_vel_y_ = 0.0;
+        target_vel_yaw_ = 0.0;
+    }
     Eigen::Vector3d cmd_world(target_vel_x_, target_vel_y_, 0.0);
     Eigen::Vector3d cmd_bf = quatRotateInverse(q, cmd_world);
     state_cur_[data_idx++] = target_vel_x_;
@@ -2178,6 +2193,12 @@ void CustomController::computeSlow()
             phase_started_ = false;
             phase_time_s_ = 0.0;
             phase_last_update_us_ = 0;
+            init_pose_hold_toggle_request_ = false;
+            init_pose_hold_active_ = false;
+            btn1_gravity_stopped_ = false;
+            cmd_zero_lock_ = false;
+            cmd_stop_min_phase_cycles_ = 0.0;
+            last_sim_time_observed_s_ = -1.0;
             sim_time_prev_s_ = sim_time_s_;
             // Treat mode-7 entry as a one-shot "send" so phase starts even with GUI-only control.
             mode7_send_triggered_ = true;
@@ -2330,6 +2351,22 @@ void CustomController::computeSlow()
         }
 
         mode7_active_ = true;
+        if (sim_time_received_)
+        {
+            if (last_sim_time_observed_s_ >= 0.0 && sim_time_s_ + 1.0e-6 < last_sim_time_observed_s_)
+            {
+                // Sim reset detected (time jump backwards): restart like initial mode7 warm-up.
+                leg_hist_core_queue_.clear();
+                rl_action_.setZero();
+                rl_action_pre_.setZero();
+                rl_action_arm_.setZero();
+                rl_action_arm_pre_.setZero();
+                mode7_send_triggered_ = true;
+                time_inference_pre_ = rd_cc_.control_time_us_;
+                ROS_INFO("[MODE7] Sim reset detected. Rebuilding observation history before policy.");
+            }
+            last_sim_time_observed_s_ = sim_time_s_;
+        }
         if (mode7_send_triggered_)
         {
             // Reset phase and last action on send so the next obs reflects the reset.
@@ -2473,6 +2510,57 @@ void CustomController::computeSlow()
             time_inference_pre_ = rd_cc_.control_time_us_;
         }
 
+        if (init_pose_hold_toggle_request_)
+        {
+            bool cycle_ready = (phase_period_s_ <= 0.0);
+            bool switch_now = false;
+            double phase_cycles = 0.0;
+            if (phase_period_s_ > 0.0)
+            {
+                phase_cycles = (phase_time_s_ + phase_offset_s_) / phase_period_s_;
+                cycle_ready = (phase_cycles >= cmd_stop_min_phase_cycles_);
+            }
+            if (cycle_ready)
+            {
+                double phase_prog = std::fmod(phase_cycles, 1.0);
+                if (phase_prog < 0.0)
+                {
+                    phase_prog += 1.0;
+                }
+                const double d0 = std::min(phase_prog, 1.0 - phase_prog);
+                const double d05 = std::abs(phase_prog - 0.5);
+                constexpr double kPhaseTol = 0.03;
+                switch_now = (d0 <= kPhaseTol || d05 <= kPhaseTol);
+            }
+            if (switch_now)
+            {
+                init_pose_hold_toggle_request_ = false;
+                init_pose_hold_active_ = false;
+                btn1_gravity_stopped_ = true;
+
+                // Hold current pose with PD instead of gravity mode.
+                tocabi_msgs::positionCommand msg;
+                msg.traj_time = 0.02;
+                msg.gravity = false;
+                msg.relative = false;
+                for (int i = 0; i < MODEL_DOF; i++)
+                {
+                    msg.position[i] = q_noise_(i);
+                }
+                pos_cmd_pub_.publish(msg);
+                rd_.pc_mode = true;
+                rd_.pc_gravity = false;
+                rd_.pc_time_ = rd_cc_.control_time_;
+                rd_.pc_traj_time_ = 0.02;
+                rd_.pc_pos_init = q_noise_;
+                rd_.pc_pos_des = q_noise_;
+                rd_.pc_vel_init.setZero();
+                rd_.tc_run = false;
+                rd_.tc_init = false;
+                ROS_INFO("[MODE7] Switched to current-q PD hold at phase 0/0.5 boundary.");
+            }
+        }
+
         const size_t required_hist_len = get_required_leg_hist_len();
         const bool hist_ready_for_control = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
         if (!hist_ready_for_control)
@@ -2509,43 +2597,47 @@ void CustomController::computeSlow()
             return;
         }
 
-        Vector12d target_pos;
+        Vector12d target_pos = Vector12d::Zero();
         Eigen::Matrix<double, num_arm_action, 1> target_pos_arm;
+        target_pos_arm.setZero();
         static int target_log_counter = 0;
-        for (int i = 0; i < num_actuator_action; i++)
-        {
-            double a = DyrosMath::minmax_cut(rl_action_(i), -1.0, 1.0);
-            const double lo = leg_joint_pos_limits_[i][0] * q_limit_scale_;
-            const double hi = leg_joint_pos_limits_[i][1] * q_limit_scale_;
-            double target = 0.5 * (a + 1.0) * (hi - lo) + lo;
-            if (has_joint_limits_)
-            {
-                int joint_idx = kLegJointMapAction[i];
-                target = DyrosMath::minmax_cut(target, q_min_(joint_idx), q_max_(joint_idx));
-            }
-            target_pos(i) = target;
-        }
         rd_.q_desired = q_init_mode7_;
-        for (int i = 0; i < num_actuator_action; i++)
+        if (!init_pose_hold_active_)
         {
-            const int joint_idx = kLegJointMapAction[i];
-            rd_.q_desired(joint_idx) = target_pos(i);
-        }
-        if (use_arm_policy_)
-        {
-            for (int i = 0; i < num_arm_action; i++)
+            for (int i = 0; i < num_actuator_action; i++)
             {
-                const int joint_idx = kArmJointMapAction[i];
-                double a = DyrosMath::minmax_cut(rl_action_arm_(i), -1.0, 1.0);
-                const double lo = arm_joint_pos_limits_[i][0] * q_limit_scale_;
-                const double hi = arm_joint_pos_limits_[i][1] * q_limit_scale_;
+                double a = DyrosMath::minmax_cut(rl_action_(i), -1.0, 1.0);
+                const double lo = leg_joint_pos_limits_[i][0] * q_limit_scale_;
+                const double hi = leg_joint_pos_limits_[i][1] * q_limit_scale_;
                 double target = 0.5 * (a + 1.0) * (hi - lo) + lo;
                 if (has_joint_limits_)
                 {
+                    int joint_idx = kLegJointMapAction[i];
                     target = DyrosMath::minmax_cut(target, q_min_(joint_idx), q_max_(joint_idx));
                 }
-                target_pos_arm(i) = target;
-                rd_.q_desired(joint_idx) = target_pos_arm(i);
+                target_pos(i) = target;
+            }
+            for (int i = 0; i < num_actuator_action; i++)
+            {
+                const int joint_idx = kLegJointMapAction[i];
+                rd_.q_desired(joint_idx) = target_pos(i);
+            }
+            if (use_arm_policy_)
+            {
+                for (int i = 0; i < num_arm_action; i++)
+                {
+                    const int joint_idx = kArmJointMapAction[i];
+                    double a = DyrosMath::minmax_cut(rl_action_arm_(i), -1.0, 1.0);
+                    const double lo = arm_joint_pos_limits_[i][0] * q_limit_scale_;
+                    const double hi = arm_joint_pos_limits_[i][1] * q_limit_scale_;
+                    double target = 0.5 * (a + 1.0) * (hi - lo) + lo;
+                    if (has_joint_limits_)
+                    {
+                        target = DyrosMath::minmax_cut(target, q_min_(joint_idx), q_max_(joint_idx));
+                    }
+                    target_pos_arm(i) = target;
+                    rd_.q_desired(joint_idx) = target_pos_arm(i);
+                }
             }
         }
         // bool log_due = debug_log_this_step_ || ((target_log_counter++ % 100) == 0);
@@ -2564,23 +2656,34 @@ void CustomController::computeSlow()
         //     }
         //     ROS_INFO_STREAM(oss.str());
         // }
-        for (int i = 0; i < num_actuator_action; i++)
+        if (!init_pose_hold_active_)
         {
-            int joint_idx = kLegJointMapAction[i];
-            torque_rl_(joint_idx) = kp_(joint_idx, joint_idx) / 9.0 *
-                                        (target_pos(i) - q_noise_(joint_idx)) -
-                                    kv_(joint_idx, joint_idx) / 3.0 *
-                                        (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(joint_idx) : q_vel_noise_(joint_idx));
-        }
-        if (use_arm_policy_)
-        {
-            for (int i = 0; i < num_arm_action; i++)
+            for (int i = 0; i < num_actuator_action; i++)
             {
-                const int joint_idx = kArmJointMapAction[i];
-                torque_rl_(joint_idx) = kp_(joint_idx, joint_idx) *
-                                            (target_pos_arm(i) - q_noise_(joint_idx)) -
-                                        kv_(joint_idx, joint_idx) *
+                int joint_idx = kLegJointMapAction[i];
+                torque_rl_(joint_idx) = kp_(joint_idx, joint_idx) / 9.0 *
+                                            (target_pos(i) - q_noise_(joint_idx)) -
+                                        kv_(joint_idx, joint_idx) / 3.0 *
                                             (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(joint_idx) : q_vel_noise_(joint_idx));
+            }
+            if (use_arm_policy_)
+            {
+                for (int i = 0; i < num_arm_action; i++)
+                {
+                    const int joint_idx = kArmJointMapAction[i];
+                    torque_rl_(joint_idx) = kp_(joint_idx, joint_idx) *
+                                                (target_pos_arm(i) - q_noise_(joint_idx)) -
+                                            kv_(joint_idx, joint_idx) *
+                                                (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(joint_idx) : q_vel_noise_(joint_idx));
+                }
+            }
+        }
+        else
+        {
+            for (int i = 0; i < MODEL_DOF; i++)
+            {
+                torque_rl_(i) = kp_(i, i) * (q_init_mode7_(i) - q_noise_(i)) -
+                                kv_(i, i) * (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(i) : q_vel_noise_(i));
             }
         }
         for (int i = 0; i < MODEL_DOF; i++)
@@ -2653,6 +2756,12 @@ void CustomController::computeSlow()
     }
     prev_tc_mode_ = tc_mode;
     mode7_active_ = false;
+    init_pose_hold_toggle_request_ = false;
+    init_pose_hold_active_ = false;
+    btn1_gravity_stopped_ = false;
+    cmd_zero_lock_ = false;
+    cmd_stop_min_phase_cycles_ = 0.0;
+    last_sim_time_observed_s_ = -1.0;
     LF_CF_FT_pre = rd_cc_.LF_CF_FT;
     RF_CF_FT_pre = rd_cc_.RF_CF_FT;
 }
@@ -2974,11 +3083,62 @@ void CustomController::guiSendCallback(const std_msgs::Empty::ConstPtr& msg)
     mode7_send_triggered_ = true;
 }
 
+void CustomController::handleMode7ToggleRequest()
+{
+    const bool mode_is_7 = (rd_cc_.tc_.mode == 7);
+    if (!mode_is_7 || btn1_gravity_stopped_)
+    {
+        init_pose_hold_toggle_request_ = false;
+        tocabi_msgs::TaskCommand msg;
+        msg.mode = 7;
+        task_cmd_pub_.publish(msg);
+        mode7_send_triggered_ = true;
+        btn1_gravity_stopped_ = false;
+        cmd_zero_lock_ = false;
+        debug_log_steps_remaining_ = 5;
+        ROS_INFO("[MODE7] Requested return to policy mode.");
+    }
+    else
+    {
+        init_pose_hold_toggle_request_ = true;
+        init_pose_hold_active_ = false;
+        btn1_gravity_stopped_ = false;
+        cmd_zero_lock_ = true;
+        target_vel_x_ = 0.0;
+        target_vel_y_ = 0.0;
+        target_vel_yaw_ = 0.0;
+        if (phase_period_s_ > 0.0)
+        {
+            cmd_stop_min_phase_cycles_ = (phase_time_s_ + phase_offset_s_) / phase_period_s_ + 1.0;
+        }
+        else
+        {
+            cmd_stop_min_phase_cycles_ = 0.0;
+        }
+        ROS_INFO("[MODE7] Requested stop. cmd->0 now, then switch to current-q PD hold after one phase cycle at 0/0.5.");
+    }
+}
+
+void CustomController::mode7ToggleCallback(const std_msgs::Empty::ConstPtr& msg)
+{
+    if (joystick_enabled_)
+    {
+        return;
+    }
+    handleMode7ToggleRequest();
+}
+
 void CustomController::joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
 {
     target_vel_x_ = DyrosMath::minmax_cut(joy->axes[1] * cmd_scale_x_, -cmd_scale_x_, cmd_scale_x_);
     target_vel_y_ = DyrosMath::minmax_cut(joy->axes[0] * cmd_scale_y_, -cmd_scale_y_, cmd_scale_y_);
     target_vel_yaw_ = DyrosMath::minmax_cut(joy->axes[3] * cmd_scale_yaw_, -cmd_scale_yaw_, cmd_scale_yaw_);
+    if (cmd_zero_lock_)
+    {
+        target_vel_x_ = 0.0;
+        target_vel_y_ = 0.0;
+        target_vel_yaw_ = 0.0;
+    }
 
     int yaw_dir = 0;
     if (joy->buttons.size() > 4 && joy->buttons[4]) yaw_dir += 1;
@@ -3001,6 +3161,29 @@ void CustomController::joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
         cam_cmd_pub_.publish(cam_msg);
     }
 
+    int axis6_dir = 0;
+    if (joy->axes.size() > 6)
+    {
+        if (joy->axes[6] < -0.5f) axis6_dir = 1;   // b: single throw
+        else if (joy->axes[6] > 0.5f) axis6_dir = -1; // n: repeat toggle
+    }
+    if (axis6_dir != 0 && axis6_dir != prev_axis6_dir_)
+    {
+        std_msgs::String msg;
+        if (axis6_dir < 0)
+        {
+            msg.data = "ball_throw";
+            ROS_INFO("[BALL] Joystick trigger throw.");
+        }
+        else
+        {
+            msg.data = "ball_repeat_toggle";
+            ROS_INFO("[BALL] Joystick toggle repeat.");
+        }
+        sim_command_pub_.publish(msg);
+    }
+    prev_axis6_dir_ = axis6_dir;
+
     bool btn0 = (joy->buttons.size() > 0) ? (joy->buttons[0] != 0) : false;
     if (btn0 && !prev_btn0_)
     {
@@ -3014,12 +3197,7 @@ void CustomController::joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
     bool btn1 = (joy->buttons.size() > 1) ? (joy->buttons[1] != 0) : false;
     if (btn1 && !prev_btn1_)
     {
-        tocabi_msgs::TaskCommand msg;
-        msg.mode = 7;
-        task_cmd_pub_.publish(msg);
-        debug_log_steps_remaining_ = 5;
-        std_msgs::Empty send_msg;
-        // gui_send_pub_.publish(send_msg);
+        handleMode7ToggleRequest();
     }
     prev_btn1_ = btn1;
 
@@ -3100,6 +3278,9 @@ void CustomController::joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
         sim_command_pub_.publish(msg);
     }
     prev_btn10_ = btn10;
+
+    bool btn12 = (joy->buttons.size() > 12) ? (joy->buttons[12] != 0) : false;
+    prev_btn12_ = btn12;
 }
 
 void CustomController::simTimeCallback(const std_msgs::Float32ConstPtr& msg)
@@ -3114,6 +3295,25 @@ void CustomController::xBoxJoyCallback(const sensor_msgs::Joy::ConstPtr& joy)
     target_vel_x_ = DyrosMath::minmax_cut(joy->axes[1] * cmd_scale_x_, -cmd_scale_x_, cmd_scale_x_);
     target_vel_y_ = DyrosMath::minmax_cut(joy->axes[0] * cmd_scale_y_, -cmd_scale_y_, cmd_scale_y_);
     target_vel_yaw_ = DyrosMath::minmax_cut(joy->axes[3] * cmd_scale_yaw_, -cmd_scale_yaw_, cmd_scale_yaw_);
+}
+
+void CustomController::keyboardCmdCallback(const std_msgs::Float32MultiArray::ConstPtr& msg)
+{
+    if (!msg || msg->data.size() < 3)
+    {
+        return;
+    }
+    if (cmd_zero_lock_)
+    {
+        target_vel_x_ = 0.0;
+        target_vel_y_ = 0.0;
+        target_vel_yaw_ = 0.0;
+        return;
+    }
+
+    target_vel_x_ = DyrosMath::minmax_cut(msg->data[0], -cmd_scale_x_, cmd_scale_x_);
+    target_vel_y_ = DyrosMath::minmax_cut(msg->data[1], -cmd_scale_y_, cmd_scale_y_);
+    target_vel_yaw_ = DyrosMath::minmax_cut(msg->data[2], -cmd_scale_yaw_, cmd_scale_yaw_);
 }
 
 void CustomController::quatToTanNorm(const Eigen::Quaterniond& quaternion, Eigen::Vector3d& tangent, Eigen::Vector3d& normal) {
