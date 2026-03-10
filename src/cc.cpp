@@ -1135,30 +1135,30 @@ void CustomController::processObservation()
 //             }
 //         }
 // #endif
-        if (!use_casadi_cam_ || !casadi_cam_ready_)
-        {
-            Eigen::VectorXd vdes = Eigen::VectorXd::Zero(MODEL_DOF_VIRTUAL);
-            vdes(0) = target_vel_x_;
-            vdes(1) = target_vel_y_;
-            vdes(5) = target_vel_yaw_;
-            cm_des = rd_cc_.CMM * vdes;
-        }
-        Eigen::Matrix3d Rwb = q.toRotationMatrix();
-        Eigen::Matrix3d Rbw = Rwb.transpose();
-        Eigen::Vector6d cm_bf;
-        Eigen::Vector6d cm_des_bf;
-        cm_bf.head<3>() = Rbw * cm.head<3>();
-        cm_bf.tail<3>() = Rbw * cm.tail<3>();
-        cm_des_bf.head<3>() = Rbw * cm_des.head<3>();
-        cm_des_bf.tail<3>() = Rbw * cm_des.tail<3>();
-        cam_bf_ = cm_bf.tail<3>();
-        cam_des_bf_ = cm_des_bf.tail<3>();
-        if (include_cam_obs_)
-        {
-            state_cur_[data_idx++] = cam_bf_(0);
-            state_cur_[data_idx++] = cam_bf_(1);
-            state_cur_[data_idx++] = cam_bf_(2);
-        }
+        // if (!use_casadi_cam_ || !casadi_cam_ready_)
+        // {
+        //     Eigen::VectorXd vdes = Eigen::VectorXd::Zero(MODEL_DOF_VIRTUAL);
+        //     vdes(0) = target_vel_x_;
+        //     vdes(1) = target_vel_y_;
+        //     vdes(5) = target_vel_yaw_;
+        //     cm_des = rd_cc_.CMM * vdes;
+        // }
+        // Eigen::Matrix3d Rwb = q.toRotationMatrix();
+        // Eigen::Matrix3d Rbw = Rwb.transpose();
+        // Eigen::Vector6d cm_bf;
+        // Eigen::Vector6d cm_des_bf;
+        // cm_bf.head<3>() = Rbw * cm.head<3>();
+        // cm_bf.tail<3>() = Rbw * cm.tail<3>();
+        // cm_des_bf.head<3>() = Rbw * cm_des.head<3>();
+        // cm_des_bf.tail<3>() = Rbw * cm_des.tail<3>();
+        // cam_bf_ = cm_bf.tail<3>();
+        // cam_des_bf_ = cm_des_bf.tail<3>();
+        // if (include_cam_obs_)
+        // {
+        //     state_cur_[data_idx++] = cam_bf_(0);
+        //     state_cur_[data_idx++] = cam_bf_(1);
+        //     state_cur_[data_idx++] = cam_bf_(2);
+        // }
     }
 
     if (se_log_active_ && se_log_file_.is_open())

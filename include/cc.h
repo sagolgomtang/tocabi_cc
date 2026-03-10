@@ -283,15 +283,15 @@ public:
 
     bool use_casadi_cam_ = false;
     std::string casadi_cmm_path_;
-#ifdef TOCABI_CC_USE_CASADI
-    bool casadi_cam_ready_ = false;
-#else
-    bool casadi_cam_ready_ = false;
-#endif
-#ifdef TOCABI_CC_USE_CASADI
-    casadi::Function cmm_fn_;
-    bool casadi_cam_ready_ = false;
-#endif
+// #ifdef TOCABI_CC_USE_CASADI
+//     bool casadi_cam_ready_ = false;
+// #else
+//     bool casadi_cam_ready_ = false;
+// #endif
+// #ifdef TOCABI_CC_USE_CASADI
+//     casadi::Function cmm_fn_;
+//     bool casadi_cam_ready_ = false;
+// #endif
     int debug_log_steps_remaining_ = 0;
     bool debug_log_this_step_ = false;
     bool mode7_active_ = false;
