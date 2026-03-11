@@ -19,6 +19,7 @@
 #include <deque>
 #include <string>
 #include <vector>
+#include <cstdint>
 
 #ifdef TOCABI_CC_USE_CASADI
 #include <casadi/casadi.hpp>
@@ -177,6 +178,9 @@ public:
     void keyboardCmdCallback(const std_msgs::Float32MultiArray::ConstPtr& msg);
     void mode7ToggleCallback(const std_msgs::Empty::ConstPtr& msg);
     void handleMode7ToggleRequest();
+    void pollDirectJoystick();
+    void closeDirectJoystick();
+    void directJoystickTimerCallback(const ros::TimerEvent&);
     void simTimeCallback(const std_msgs::Float32ConstPtr& msg);
     ros::Subscriber joy_sub_;
     ros::Subscriber xbox_joy_sub_;
@@ -193,6 +197,7 @@ public:
     ros::Subscriber gui_send_sub_;
     ros::Publisher task_cmd_pub_;
     ros::Publisher pos_cmd_pub_;
+    ros::Timer direct_joy_timer_;
     bool prev_btn9_ = false;
     bool prev_btn0_ = false;
     bool prev_btn10_ = false;
@@ -204,6 +209,13 @@ public:
     bool btn1_gravity_stopped_ = false;
     bool cmd_zero_lock_ = false;
     bool joystick_enabled_ = false;
+    bool direct_joystick_enabled_ = false;
+    std::string direct_joystick_device_ = "/dev/input/js0";
+    int direct_joystick_fd_ = -1;
+    double direct_joystick_last_open_try_s_ = -1.0;
+    std::vector<float> direct_joy_axes_;
+    std::vector<int32_t> direct_joy_buttons_;
+    std::vector<int32_t> direct_joy_press_latch_;
     double cmd_stop_min_phase_cycles_ = 0.0;
     int prev_axis6_dir_ = 0;
     void guiSendCallback(const std_msgs::Empty::ConstPtr& msg);
@@ -221,6 +233,12 @@ public:
     double target_vel_x_ = 0.0;
     double target_vel_y_ = 0.0;
     double target_vel_yaw_ = 0.0;
+    double target_vel_raw_x_ = 0.0;
+    double target_vel_raw_y_ = 0.0;
+    double target_vel_raw_yaw_ = 0.0;
+    double cmd_ema_window_s_ = 0.2;
+    int64_t cmd_ema_last_us_ = 0;
+    bool cmd_ema_initialized_ = false;
 
     float desired_vel_x = 0.0;
     float desired_vel_yaw = 0.0;
@@ -240,6 +258,7 @@ public:
     double cmd_scale_x_ = 1.0;
     double cmd_scale_y_ = 0.5;
     double cmd_scale_yaw_ = 0.6;
+    double joystick_deadzone_ = 0.1;
 
     Eigen::Matrix<double, num_action, 1> action_rate_;
     std::deque<std::vector<float>> leg_hist_core_queue_;

@@ -4,9 +4,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <fcntl.h>
+#include <linux/joystick.h>
+#include <unistd.h>
 #include <yaml-cpp/yaml.h>
 
 using namespace TOCABI;
@@ -257,16 +263,25 @@ CustomController::CustomController(RobotData &rd)
         if (cc_cfg["cmd_scale_x"]) cmd_scale_x_ = cc_cfg["cmd_scale_x"].as<double>();
         if (cc_cfg["cmd_scale_y"]) cmd_scale_y_ = cc_cfg["cmd_scale_y"].as<double>();
         if (cc_cfg["cmd_scale_yaw"]) cmd_scale_yaw_ = cc_cfg["cmd_scale_yaw"].as<double>();
+        if (cc_cfg["cmd_ema_window_s"]) cmd_ema_window_s_ = cc_cfg["cmd_ema_window_s"].as<double>();
+        if (cc_cfg["joystick_deadzone"]) joystick_deadzone_ = cc_cfg["joystick_deadzone"].as<double>();
         if (cc_cfg["cmd_vis_scale"]) cmd_vis_scale_ = cc_cfg["cmd_vis_scale"].as<double>();
         if (cc_cfg["q_limit_scale"]) q_limit_scale_ = cc_cfg["q_limit_scale"].as<double>();
         if (cc_cfg["use_casadi_cam"]) use_casadi_cam_ = cc_cfg["use_casadi_cam"].as<bool>();
         if (cc_cfg["casadi_cmm_path"]) casadi_cmm_path_ = cc_cfg["casadi_cmm_path"].as<std::string>();
+        if (cc_cfg["direct_joystick_enabled"]) direct_joystick_enabled_ = cc_cfg["direct_joystick_enabled"].as<bool>();
+        if (cc_cfg["direct_joystick_device"]) direct_joystick_device_ = cc_cfg["direct_joystick_device"].as<std::string>();
     }
 
     if (policy_hz_ <= 0.0)
     {
         ROS_WARN_STREAM("[POLICY] Invalid policy_hz=" << policy_hz_ << ", fallback to 50.0");
         policy_hz_ = 50.0;
+    }
+    if (cmd_ema_window_s_ < 0.0)
+    {
+        ROS_WARN_STREAM("[CMD] Invalid cmd_ema_window_s=" << cmd_ema_window_s_ << ", fallback to 0.2");
+        cmd_ema_window_s_ = 0.2;
     }
 
     // Keep MuJoCo keyboard command clamp limits aligned with the controller config.
@@ -390,7 +405,16 @@ CustomController::CustomController(RobotData &rd)
         loadArmOnnX();
     }
 
-    joy_sub_ = nh_.subscribe<sensor_msgs::Joy>("/joy_gui", 10, &CustomController::joyCallback, this);
+    if (!direct_joystick_enabled_)
+    {
+        joy_sub_ = nh_.subscribe<sensor_msgs::Joy>("/joy", 10, &CustomController::joyCallback, this);
+    }
+    else
+    {
+        ROS_INFO_STREAM("[JOY] Direct joystick mode enabled. device=" << direct_joystick_device_);
+        // Poll direct joystick independent of control mode/state.
+        direct_joy_timer_ = nh_.createTimer(ros::Duration(0.01), &CustomController::directJoystickTimerCallback, this);
+    }
     // xbox_joy_sub_ = nh_.subscribe<sensor_msgs::Joy>("/joy", 10, &CustomController::xBoxJoyCallback, this);
     keyboard_cmd_sub_ = nh_.subscribe<std_msgs::Float32MultiArray>("/mujoco_ros_interface/cmd_vel_keyboard", 10, &CustomController::keyboardCmdCallback, this);
     mode7_toggle_sub_ = nh_.subscribe<std_msgs::Empty>("/tocabi_cc/mode7_toggle", 10, &CustomController::mode7ToggleCallback, this);
@@ -941,12 +965,39 @@ void CustomController::processObservation()
     gravity_cur[1] = static_cast<float>(gravity_bf(1));
     gravity_cur[2] = static_cast<float>(gravity_bf(2));
 
-    // velocity_commands (as-is)
+    // velocity_commands (windowed time EMA from raw joystick/keyboard command)
     if (cmd_zero_lock_)
     {
+        target_vel_raw_x_ = 0.0;
+        target_vel_raw_y_ = 0.0;
+        target_vel_raw_yaw_ = 0.0;
         target_vel_x_ = 0.0;
         target_vel_y_ = 0.0;
         target_vel_yaw_ = 0.0;
+        cmd_ema_initialized_ = true;
+        cmd_ema_last_us_ = rd_cc_.control_time_us_;
+    }
+    else
+    {
+        const double dt_cmd = (cmd_ema_last_us_ > 0)
+                                  ? (rd_cc_.control_time_us_ - cmd_ema_last_us_) / 1.0e6
+                                  : 0.0;
+        cmd_ema_last_us_ = rd_cc_.control_time_us_;
+
+        if (!cmd_ema_initialized_ || !(dt_cmd > 0.0) || cmd_ema_window_s_ <= 0.0)
+        {
+            target_vel_x_ = target_vel_raw_x_;
+            target_vel_y_ = target_vel_raw_y_;
+            target_vel_yaw_ = target_vel_raw_yaw_;
+            cmd_ema_initialized_ = true;
+        }
+        else
+        {
+            const double alpha = 1.0 - std::exp(-dt_cmd / cmd_ema_window_s_);
+            target_vel_x_ += (target_vel_raw_x_ - target_vel_x_) * alpha;
+            target_vel_y_ += (target_vel_raw_y_ - target_vel_y_) * alpha;
+            target_vel_yaw_ += (target_vel_raw_yaw_ - target_vel_yaw_) * alpha;
+        }
     }
     Eigen::Vector3d cmd_world(target_vel_x_, target_vel_y_, 0.0);
     Eigen::Vector3d cmd_bf = quatRotateInverse(q, cmd_world);
@@ -1668,6 +1719,7 @@ void CustomController::feedforwardArmPolicy()
 void CustomController::computeSlow()
 {
     copyRobotData(rd_);
+    pollDirectJoystick();
     const int tc_mode = rd_cc_.tc_.mode;
     auto finalize_action_rate_stats_log = [this]() {
         constexpr size_t kActionRateLogStartStep = 200;
@@ -1908,6 +1960,7 @@ void CustomController::computeSlow()
                 {
                     processObservation();
                 }
+                const auto policy_t0 = std::chrono::steady_clock::now();
                 feedforwardPolicy();
                 test_policy_step_++;
                 update_action_rate_time_avg();
@@ -1915,6 +1968,17 @@ void CustomController::computeSlow()
                 {
                     processArmObservation();
                     feedforwardArmPolicy();
+                }
+                const double policy_elapsed_s =
+                    std::chrono::duration_cast<std::chrono::duration<double>>(
+                        std::chrono::steady_clock::now() - policy_t0).count();
+                const double policy_period_s = 1.0 / policy_hz_;
+                if (policy_elapsed_s > policy_period_s)
+                {
+                    ROS_WARN_STREAM_THROTTLE(1.0,
+                        "[POLICY] Inference overrun: elapsed=" << policy_elapsed_s * 1000.0
+                        << " ms, budget=" << policy_period_s * 1000.0
+                        << " ms (" << policy_hz_ << " Hz)");
                 }
             if (test_act_file_ || test_act_mapped_file_ || test_action_rate_stats_file_)
             {
@@ -2319,6 +2383,7 @@ void CustomController::computeSlow()
             const bool hist_ready = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
             if (hist_ready)
             {
+                const auto policy_t0 = std::chrono::steady_clock::now();
                 feedforwardPolicy();
                 test_policy_step_++;
                 update_action_rate_time_avg();
@@ -2326,6 +2391,17 @@ void CustomController::computeSlow()
                 {
                     processArmObservation();
                     feedforwardArmPolicy();
+                }
+                const double policy_elapsed_s =
+                    std::chrono::duration_cast<std::chrono::duration<double>>(
+                        std::chrono::steady_clock::now() - policy_t0).count();
+                const double policy_period_s = 1.0 / policy_hz_;
+                if (policy_elapsed_s > policy_period_s)
+                {
+                    ROS_WARN_STREAM_THROTTLE(1.0,
+                        "[POLICY] Inference overrun: elapsed=" << policy_elapsed_s * 1000.0
+                        << " ms, budget=" << policy_period_s * 1000.0
+                        << " ms (" << policy_hz_ << " Hz)");
                 }
             }
             else
@@ -2412,6 +2488,7 @@ void CustomController::computeSlow()
             const bool hist_ready = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
             if (hist_ready)
             {
+                const auto policy_t0 = std::chrono::steady_clock::now();
                 feedforwardPolicy();
                 mode7_policy_ran_this_tick = true;
                 test_policy_step_++;
@@ -2420,6 +2497,17 @@ void CustomController::computeSlow()
                 {
                     processArmObservation();
                     feedforwardArmPolicy();
+                }
+                const double policy_elapsed_s =
+                    std::chrono::duration_cast<std::chrono::duration<double>>(
+                        std::chrono::steady_clock::now() - policy_t0).count();
+                const double policy_period_s = 1.0 / policy_hz_;
+                if (policy_elapsed_s > policy_period_s)
+                {
+                    ROS_WARN_STREAM_THROTTLE(1.0,
+                        "[POLICY] Inference overrun: elapsed=" << policy_elapsed_s * 1000.0
+                        << " ms, budget=" << policy_period_s * 1000.0
+                        << " ms (" << policy_hz_ << " Hz)");
                 }
             }
             else
@@ -2760,6 +2848,14 @@ void CustomController::computeSlow()
     init_pose_hold_active_ = false;
     btn1_gravity_stopped_ = false;
     cmd_zero_lock_ = false;
+    target_vel_raw_x_ = 0.0;
+    target_vel_raw_y_ = 0.0;
+    target_vel_raw_yaw_ = 0.0;
+    target_vel_x_ = 0.0;
+    target_vel_y_ = 0.0;
+    target_vel_yaw_ = 0.0;
+    cmd_ema_initialized_ = false;
+    cmd_ema_last_us_ = 0;
     cmd_stop_min_phase_cycles_ = 0.0;
     last_sim_time_observed_s_ = -1.0;
     LF_CF_FT_pre = rd_cc_.LF_CF_FT;
@@ -3095,6 +3191,8 @@ void CustomController::handleMode7ToggleRequest()
         mode7_send_triggered_ = true;
         btn1_gravity_stopped_ = false;
         cmd_zero_lock_ = false;
+        cmd_ema_initialized_ = false;
+        cmd_ema_last_us_ = 0;
         debug_log_steps_remaining_ = 5;
         ROS_INFO("[MODE7] Requested return to policy mode.");
     }
@@ -3104,6 +3202,9 @@ void CustomController::handleMode7ToggleRequest()
         init_pose_hold_active_ = false;
         btn1_gravity_stopped_ = false;
         cmd_zero_lock_ = true;
+        target_vel_raw_x_ = 0.0;
+        target_vel_raw_y_ = 0.0;
+        target_vel_raw_yaw_ = 0.0;
         target_vel_x_ = 0.0;
         target_vel_y_ = 0.0;
         target_vel_yaw_ = 0.0;
@@ -3128,13 +3229,136 @@ void CustomController::mode7ToggleCallback(const std_msgs::Empty::ConstPtr& msg)
     handleMode7ToggleRequest();
 }
 
+void CustomController::directJoystickTimerCallback(const ros::TimerEvent&)
+{
+    pollDirectJoystick();
+}
+
+void CustomController::closeDirectJoystick()
+{
+    if (direct_joystick_fd_ >= 0)
+    {
+        close(direct_joystick_fd_);
+        direct_joystick_fd_ = -1;
+    }
+}
+
+void CustomController::pollDirectJoystick()
+{
+    if (!direct_joystick_enabled_)
+    {
+        return;
+    }
+
+    const double now_s = ros::Time::now().toSec();
+    if (direct_joystick_fd_ < 0)
+    {
+        if (direct_joystick_last_open_try_s_ >= 0.0 &&
+            (now_s - direct_joystick_last_open_try_s_) < 1.0)
+        {
+            return;
+        }
+
+        direct_joystick_last_open_try_s_ = now_s;
+        direct_joystick_fd_ = open(direct_joystick_device_.c_str(), O_RDONLY | O_NONBLOCK);
+        if (direct_joystick_fd_ < 0)
+        {
+            ROS_WARN_STREAM_THROTTLE(2.0, "[JOY] Failed to open " << direct_joystick_device_
+                                     << " (" << std::strerror(errno) << ")");
+            return;
+        }
+
+        direct_joy_axes_.assign(16, 0.0f);
+        direct_joy_buttons_.assign(16, 0);
+        direct_joy_press_latch_.assign(16, 0);
+        ROS_INFO_STREAM("[JOY] Connected direct joystick: " << direct_joystick_device_);
+    }
+
+    bool updated = false;
+    js_event e{};
+    while (true)
+    {
+        const ssize_t n = read(direct_joystick_fd_, &e, sizeof(e));
+        if (n == static_cast<ssize_t>(sizeof(e)))
+        {
+            const uint8_t type = static_cast<uint8_t>(e.type & ~JS_EVENT_INIT);
+            if (type == JS_EVENT_AXIS)
+            {
+                if (e.number >= direct_joy_axes_.size())
+                {
+                    direct_joy_axes_.resize(e.number + 1, 0.0f);
+                }
+                direct_joy_axes_[e.number] = std::max(-1.0f, std::min(1.0f, static_cast<float>(e.value) / 32767.0f));
+                updated = true;
+            }
+            else if (type == JS_EVENT_BUTTON)
+            {
+                if (e.number >= direct_joy_buttons_.size())
+                {
+                    direct_joy_buttons_.resize(e.number + 1, 0);
+                }
+                if (e.number >= direct_joy_press_latch_.size())
+                {
+                    direct_joy_press_latch_.resize(e.number + 1, 0);
+                }
+                direct_joy_buttons_[e.number] = (e.value != 0) ? 1 : 0;
+                if (e.value != 0)
+                {
+                    // Latch short taps so edge-triggered logic in joyCallback doesn't miss them.
+                    direct_joy_press_latch_[e.number] = 1;
+                }
+                updated = true;
+            }
+            continue;
+        }
+
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            break;
+        }
+
+        ROS_WARN_STREAM_THROTTLE(1.0, "[JOY] Direct joystick disconnected/read error. Reconnecting...");
+        closeDirectJoystick();
+        return;
+    }
+
+    sensor_msgs::JoyPtr joy_msg(new sensor_msgs::Joy());
+    joy_msg->axes = direct_joy_axes_;
+    const size_t btn_n = std::max(direct_joy_buttons_.size(), direct_joy_press_latch_.size());
+    joy_msg->buttons.reserve(btn_n);
+    for (size_t i = 0; i < btn_n; ++i)
+    {
+        const int32_t level = (i < direct_joy_buttons_.size()) ? direct_joy_buttons_[i] : 0;
+        const int32_t latched = (i < direct_joy_press_latch_.size()) ? direct_joy_press_latch_[i] : 0;
+        joy_msg->buttons.push_back((level || latched) ? 1 : 0);
+    }
+    joyCallback(joy_msg);
+    std::fill(direct_joy_press_latch_.begin(), direct_joy_press_latch_.end(), 0);
+}
+
 void CustomController::joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
 {
-    target_vel_x_ = DyrosMath::minmax_cut(joy->axes[1] * cmd_scale_x_, -cmd_scale_x_, cmd_scale_x_);
-    target_vel_y_ = DyrosMath::minmax_cut(joy->axes[0] * cmd_scale_y_, -cmd_scale_y_, cmd_scale_y_);
-    target_vel_yaw_ = DyrosMath::minmax_cut(joy->axes[3] * cmd_scale_yaw_, -cmd_scale_yaw_, cmd_scale_yaw_);
+    auto axis_val = [&](size_t idx) -> float {
+        if (idx >= joy->axes.size())
+        {
+            return 0.0f;
+        }
+        float v = joy->axes[idx];
+        if (std::abs(v) < static_cast<float>(joystick_deadzone_))
+        {
+            v = 0.0f;
+        }
+        return v; // invert all joystick axis signs
+    };
+
+    target_vel_raw_x_ = DyrosMath::minmax_cut(axis_val(1) * cmd_scale_x_, -cmd_scale_x_, cmd_scale_x_);
+    target_vel_raw_y_ = DyrosMath::minmax_cut(axis_val(0) * cmd_scale_y_, -cmd_scale_y_, cmd_scale_y_);
+    target_vel_raw_yaw_ = DyrosMath::minmax_cut(axis_val(3) * cmd_scale_yaw_, -cmd_scale_yaw_, cmd_scale_yaw_);
     if (cmd_zero_lock_)
     {
+        target_vel_raw_x_ = 0.0;
+        target_vel_raw_y_ = 0.0;
+        target_vel_raw_yaw_ = 0.0;
         target_vel_x_ = 0.0;
         target_vel_y_ = 0.0;
         target_vel_yaw_ = 0.0;
@@ -3147,10 +3371,24 @@ void CustomController::joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
     if (joy->buttons.size() > 6 && joy->buttons[6]) zoom_dir += 1;
     if (joy->buttons.size() > 7 && joy->buttons[7]) zoom_dir -= 1;
     float elev_axis = 0.0f;
-    if (joy->axes.size() > 8)
-        elev_axis = -static_cast<float>(joy->axes[8]);
-    else if (joy->axes.size() > 7)
-        elev_axis = -static_cast<float>(joy->axes[7]);
+    if (joy->axes.size() > 7)
+    {
+        // Keep requested sign convention for camera pitch:
+        // axis[7] = +1 -> up, -1 -> down.
+        elev_axis = -joy->axes[7];
+        if (std::abs(elev_axis) < static_cast<float>(joystick_deadzone_))
+        {
+            elev_axis = 0.0f;
+        }
+    }
+    else if (joy->axes.size() > 8)
+    {
+        elev_axis = axis_val(8);
+    }
+    else if (joy->axes.size() > 4)
+    {
+        elev_axis = axis_val(4);
+    }
     if (yaw_dir != 0 || zoom_dir != 0 || elev_axis != 0.0f)
     {
         std_msgs::Float32MultiArray cam_msg;
@@ -3164,8 +3402,9 @@ void CustomController::joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
     int axis6_dir = 0;
     if (joy->axes.size() > 6)
     {
-        if (joy->axes[6] < -0.5f) axis6_dir = 1;   // b: single throw
-        else if (joy->axes[6] > 0.5f) axis6_dir = -1; // n: repeat toggle
+        const float axis6 = axis_val(6);
+        if (axis6 < -0.5f) axis6_dir = 1;   // b: single throw
+        else if (axis6 > 0.5f) axis6_dir = -1; // n: repeat toggle
     }
     if (axis6_dir != 0 && axis6_dir != prev_axis6_dir_)
     {
@@ -3292,9 +3531,21 @@ void CustomController::simTimeCallback(const std_msgs::Float32ConstPtr& msg)
 
 void CustomController::xBoxJoyCallback(const sensor_msgs::Joy::ConstPtr& joy)
 {
-    target_vel_x_ = DyrosMath::minmax_cut(joy->axes[1] * cmd_scale_x_, -cmd_scale_x_, cmd_scale_x_);
-    target_vel_y_ = DyrosMath::minmax_cut(joy->axes[0] * cmd_scale_y_, -cmd_scale_y_, cmd_scale_y_);
-    target_vel_yaw_ = DyrosMath::minmax_cut(joy->axes[3] * cmd_scale_yaw_, -cmd_scale_yaw_, cmd_scale_yaw_);
+    auto axis_val = [&](size_t idx) -> float {
+        if (idx >= joy->axes.size())
+        {
+            return 0.0f;
+        }
+        float v = joy->axes[idx];
+        if (std::abs(v) < static_cast<float>(joystick_deadzone_))
+        {
+            v = 0.0f;
+        }
+        return -v; // invert all joystick axis signs
+    };
+    target_vel_raw_x_ = DyrosMath::minmax_cut(axis_val(1) * cmd_scale_x_, -cmd_scale_x_, cmd_scale_x_);
+    target_vel_raw_y_ = DyrosMath::minmax_cut(axis_val(0) * cmd_scale_y_, -cmd_scale_y_, cmd_scale_y_);
+    target_vel_raw_yaw_ = DyrosMath::minmax_cut(axis_val(3) * cmd_scale_yaw_, -cmd_scale_yaw_, cmd_scale_yaw_);
 }
 
 void CustomController::keyboardCmdCallback(const std_msgs::Float32MultiArray::ConstPtr& msg)
@@ -3305,15 +3556,18 @@ void CustomController::keyboardCmdCallback(const std_msgs::Float32MultiArray::Co
     }
     if (cmd_zero_lock_)
     {
+        target_vel_raw_x_ = 0.0;
+        target_vel_raw_y_ = 0.0;
+        target_vel_raw_yaw_ = 0.0;
         target_vel_x_ = 0.0;
         target_vel_y_ = 0.0;
         target_vel_yaw_ = 0.0;
         return;
     }
 
-    target_vel_x_ = DyrosMath::minmax_cut(msg->data[0], -cmd_scale_x_, cmd_scale_x_);
-    target_vel_y_ = DyrosMath::minmax_cut(msg->data[1], -cmd_scale_y_, cmd_scale_y_);
-    target_vel_yaw_ = DyrosMath::minmax_cut(msg->data[2], -cmd_scale_yaw_, cmd_scale_yaw_);
+    target_vel_raw_x_ = DyrosMath::minmax_cut(msg->data[0], -cmd_scale_x_, cmd_scale_x_);
+    target_vel_raw_y_ = DyrosMath::minmax_cut(msg->data[1], -cmd_scale_y_, cmd_scale_y_);
+    target_vel_raw_yaw_ = DyrosMath::minmax_cut(msg->data[2], -cmd_scale_yaw_, cmd_scale_yaw_);
 }
 
 void CustomController::quatToTanNorm(const Eigen::Quaterniond& quaternion, Eigen::Vector3d& tangent, Eigen::Vector3d& normal) {

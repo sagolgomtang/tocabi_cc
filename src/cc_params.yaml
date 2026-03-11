@@ -1,7 +1,7 @@
 tocabi_cc:
   # Policy selection
   use_arm_policy: false
-  policy_without_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/without_arm_hist/2026-03-09_13-27-45_model_25000_leg.onnx
+  policy_without_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/without_arm_hist/2026-03-11_11-17-33_model_40000_leg.onnx
   policy_with_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/2026-02-19_10-41-28_model_500_leg.onnx
   
   using step: [ 1, 2, 3, 4, 5,]
@@ -19,6 +19,10 @@ tocabi_cc:
   cmd_scale_x: 0.25  # max 0.5
   cmd_scale_y: 0.2   # max 0.2
   cmd_scale_yaw: 0.3 # max 0.6
+  cmd_ema_window_s: 0.2
+  joystick_deadzone: 0.1
+  direct_joystick_enabled: false
+  direct_joystick_device: /dev/input/js0
   cmd_vis_scale: 1.0
   q_limit_scale: 1.0
   enable_value_stop: false
