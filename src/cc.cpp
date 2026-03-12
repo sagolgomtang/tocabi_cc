@@ -264,6 +264,7 @@ CustomController::CustomController(RobotData &rd)
         if (cc_cfg["cmd_scale_y"]) cmd_scale_y_ = cc_cfg["cmd_scale_y"].as<double>();
         if (cc_cfg["cmd_scale_yaw"]) cmd_scale_yaw_ = cc_cfg["cmd_scale_yaw"].as<double>();
         if (cc_cfg["cmd_ema_window_s"]) cmd_ema_window_s_ = cc_cfg["cmd_ema_window_s"].as<double>();
+        if (cc_cfg["cmd_zero_decay_tau_s"]) cmd_zero_decay_tau_s_ = cc_cfg["cmd_zero_decay_tau_s"].as<double>();
         if (cc_cfg["joystick_deadzone"]) joystick_deadzone_ = cc_cfg["joystick_deadzone"].as<double>();
         if (cc_cfg["cmd_vis_scale"]) cmd_vis_scale_ = cc_cfg["cmd_vis_scale"].as<double>();
         if (cc_cfg["q_limit_scale"]) q_limit_scale_ = cc_cfg["q_limit_scale"].as<double>();
@@ -282,6 +283,11 @@ CustomController::CustomController(RobotData &rd)
     {
         ROS_WARN_STREAM("[CMD] Invalid cmd_ema_window_s=" << cmd_ema_window_s_ << ", fallback to 0.2");
         cmd_ema_window_s_ = 0.2;
+    }
+    if (cmd_zero_decay_tau_s_ < 0.0)
+    {
+        ROS_WARN_STREAM("[CMD] Invalid cmd_zero_decay_tau_s=" << cmd_zero_decay_tau_s_ << ", fallback to 0.4");
+        cmd_zero_decay_tau_s_ = 0.4;
     }
 
     // Keep MuJoCo keyboard command clamp limits aligned with the controller config.
@@ -965,39 +971,45 @@ void CustomController::processObservation()
     gravity_cur[1] = static_cast<float>(gravity_bf(1));
     gravity_cur[2] = static_cast<float>(gravity_bf(2));
 
-    // velocity_commands (windowed time EMA from raw joystick/keyboard command)
+    // velocity_commands: normal EMA in walk mode, slower decay-to-zero in stop lock.
     if (cmd_zero_lock_)
     {
         target_vel_raw_x_ = 0.0;
         target_vel_raw_y_ = 0.0;
         target_vel_raw_yaw_ = 0.0;
-        target_vel_x_ = 0.0;
-        target_vel_y_ = 0.0;
-        target_vel_yaw_ = 0.0;
+        // Keep keyboard-side accumulated command pinned to zero while stop lock is active.
+        std_msgs::String reset_cmd_msg;
+        reset_cmd_msg.data = "keyboard_cmd_reset";
+        sim_command_pub_.publish(reset_cmd_msg);
+        std_msgs::String kb_lock_msg;
+        kb_lock_msg.data = "keyboard_cmd_lock";
+        sim_command_pub_.publish(kb_lock_msg);
+    }
+    else if (cmd_resume_zero_hold_ticks_ > 0)
+    {
+        target_vel_raw_x_ = 0.0;
+        target_vel_raw_y_ = 0.0;
+        target_vel_raw_yaw_ = 0.0;
+        --cmd_resume_zero_hold_ticks_;
+    }
+    const double dt_cmd = (cmd_ema_last_us_ > 0)
+                              ? (rd_cc_.control_time_us_ - cmd_ema_last_us_) / 1.0e6
+                              : 0.0;
+    cmd_ema_last_us_ = rd_cc_.control_time_us_;
+    const double tau_s = cmd_zero_lock_ ? cmd_zero_decay_tau_s_ : cmd_ema_window_s_;
+    if (!cmd_ema_initialized_ || !(dt_cmd > 0.0) || tau_s <= 0.0)
+    {
+        target_vel_x_ = target_vel_raw_x_;
+        target_vel_y_ = target_vel_raw_y_;
+        target_vel_yaw_ = target_vel_raw_yaw_;
         cmd_ema_initialized_ = true;
-        cmd_ema_last_us_ = rd_cc_.control_time_us_;
     }
     else
     {
-        const double dt_cmd = (cmd_ema_last_us_ > 0)
-                                  ? (rd_cc_.control_time_us_ - cmd_ema_last_us_) / 1.0e6
-                                  : 0.0;
-        cmd_ema_last_us_ = rd_cc_.control_time_us_;
-
-        if (!cmd_ema_initialized_ || !(dt_cmd > 0.0) || cmd_ema_window_s_ <= 0.0)
-        {
-            target_vel_x_ = target_vel_raw_x_;
-            target_vel_y_ = target_vel_raw_y_;
-            target_vel_yaw_ = target_vel_raw_yaw_;
-            cmd_ema_initialized_ = true;
-        }
-        else
-        {
-            const double alpha = 1.0 - std::exp(-dt_cmd / cmd_ema_window_s_);
-            target_vel_x_ += (target_vel_raw_x_ - target_vel_x_) * alpha;
-            target_vel_y_ += (target_vel_raw_y_ - target_vel_y_) * alpha;
-            target_vel_yaw_ += (target_vel_raw_yaw_ - target_vel_yaw_) * alpha;
-        }
+        const double alpha = 1.0 - std::exp(-dt_cmd / tau_s);
+        target_vel_x_ += (target_vel_raw_x_ - target_vel_x_) * alpha;
+        target_vel_y_ += (target_vel_raw_y_ - target_vel_y_) * alpha;
+        target_vel_yaw_ += (target_vel_raw_yaw_ - target_vel_yaw_) * alpha;
     }
     Eigen::Vector3d cmd_world(target_vel_x_, target_vel_y_, 0.0);
     Eigen::Vector3d cmd_bf = quatRotateInverse(q, cmd_world);
@@ -2625,6 +2637,15 @@ void CustomController::computeSlow()
                 init_pose_hold_toggle_request_ = false;
                 init_pose_hold_active_ = false;
                 btn1_gravity_stopped_ = true;
+                // Flush command LPF/EMA state exactly at stop transition.
+                target_vel_raw_x_ = 0.0;
+                target_vel_raw_y_ = 0.0;
+                target_vel_raw_yaw_ = 0.0;
+                target_vel_x_ = 0.0;
+                target_vel_y_ = 0.0;
+                target_vel_yaw_ = 0.0;
+                cmd_ema_initialized_ = true;
+                cmd_ema_last_us_ = rd_cc_.control_time_us_;
 
                 // Hold current pose with PD instead of gravity mode.
                 tocabi_msgs::positionCommand msg;
@@ -2848,6 +2869,7 @@ void CustomController::computeSlow()
     init_pose_hold_active_ = false;
     btn1_gravity_stopped_ = false;
     cmd_zero_lock_ = false;
+    cmd_resume_zero_hold_ticks_ = 0;
     target_vel_raw_x_ = 0.0;
     target_vel_raw_y_ = 0.0;
     target_vel_raw_yaw_ = 0.0;
@@ -2856,6 +2878,7 @@ void CustomController::computeSlow()
     target_vel_yaw_ = 0.0;
     cmd_ema_initialized_ = false;
     cmd_ema_last_us_ = 0;
+    ignore_stale_keyboard_cmd_ = false;
     cmd_stop_min_phase_cycles_ = 0.0;
     last_sim_time_observed_s_ = -1.0;
     LF_CF_FT_pre = rd_cc_.LF_CF_FT;
@@ -3191,8 +3214,20 @@ void CustomController::handleMode7ToggleRequest()
         mode7_send_triggered_ = true;
         btn1_gravity_stopped_ = false;
         cmd_zero_lock_ = false;
-        cmd_ema_initialized_ = false;
-        cmd_ema_last_us_ = 0;
+        target_vel_raw_x_ = 0.0;
+        target_vel_raw_y_ = 0.0;
+        target_vel_raw_yaw_ = 0.0;
+        target_vel_x_ = 0.0;
+        target_vel_y_ = 0.0;
+        target_vel_yaw_ = 0.0;
+        cmd_ema_initialized_ = true;
+        cmd_ema_last_us_ = rd_cc_.control_time_us_;
+        cmd_resume_zero_hold_ticks_ = 25; // ~0.1s at 250 Hz
+        // Keep ignoring stale keyboard command until a changed command arrives.
+        ignore_stale_keyboard_cmd_ = true;
+        std_msgs::String kb_unlock_msg;
+        kb_unlock_msg.data = "keyboard_cmd_unlock";
+        sim_command_pub_.publish(kb_unlock_msg);
         debug_log_steps_remaining_ = 5;
         ROS_INFO("[MODE7] Requested return to policy mode.");
     }
@@ -3202,21 +3237,31 @@ void CustomController::handleMode7ToggleRequest()
         init_pose_hold_active_ = false;
         btn1_gravity_stopped_ = false;
         cmd_zero_lock_ = true;
+        cmd_resume_zero_hold_ticks_ = 0;
+        // Latch current command so repeated stale keyboard messages can be rejected.
+        ignore_stale_keyboard_cmd_ = true;
+        stale_keyboard_cmd_x_ = target_vel_raw_x_;
+        stale_keyboard_cmd_y_ = target_vel_raw_y_;
+        stale_keyboard_cmd_yaw_ = target_vel_raw_yaw_;
         target_vel_raw_x_ = 0.0;
         target_vel_raw_y_ = 0.0;
         target_vel_raw_yaw_ = 0.0;
-        target_vel_x_ = 0.0;
-        target_vel_y_ = 0.0;
-        target_vel_yaw_ = 0.0;
         if (phase_period_s_ > 0.0)
         {
-            cmd_stop_min_phase_cycles_ = (phase_time_s_ + phase_offset_s_) / phase_period_s_ + 1.0;
+            cmd_stop_min_phase_cycles_ = (phase_time_s_ + phase_offset_s_) / phase_period_s_ + 2.0;
         }
         else
         {
             cmd_stop_min_phase_cycles_ = 0.0;
         }
-        ROS_INFO("[MODE7] Requested stop. cmd->0 now, then switch to current-q PD hold after one phase cycle at 0/0.5.");
+        // Ask keyboard command source (MuJoCo side) to clear its accumulated buffer.
+        std_msgs::String reset_cmd_msg;
+        reset_cmd_msg.data = "keyboard_cmd_reset";
+        sim_command_pub_.publish(reset_cmd_msg);
+        std_msgs::String kb_lock_msg;
+        kb_lock_msg.data = "keyboard_cmd_lock";
+        sim_command_pub_.publish(kb_lock_msg);
+        ROS_INFO("[MODE7] Requested stop. cmd->0 with smooth decay, then switch to current-q PD hold after one phase cycle at 0/0.5.");
     }
 }
 
@@ -3354,14 +3399,12 @@ void CustomController::joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
     target_vel_raw_x_ = DyrosMath::minmax_cut(axis_val(1) * cmd_scale_x_, -cmd_scale_x_, cmd_scale_x_);
     target_vel_raw_y_ = DyrosMath::minmax_cut(axis_val(0) * cmd_scale_y_, -cmd_scale_y_, cmd_scale_y_);
     target_vel_raw_yaw_ = DyrosMath::minmax_cut(axis_val(3) * cmd_scale_yaw_, -cmd_scale_yaw_, cmd_scale_yaw_);
+    ignore_stale_keyboard_cmd_ = false;
     if (cmd_zero_lock_)
     {
         target_vel_raw_x_ = 0.0;
         target_vel_raw_y_ = 0.0;
         target_vel_raw_yaw_ = 0.0;
-        target_vel_x_ = 0.0;
-        target_vel_y_ = 0.0;
-        target_vel_yaw_ = 0.0;
     }
 
     int yaw_dir = 0;
@@ -3546,6 +3589,7 @@ void CustomController::xBoxJoyCallback(const sensor_msgs::Joy::ConstPtr& joy)
     target_vel_raw_x_ = DyrosMath::minmax_cut(axis_val(1) * cmd_scale_x_, -cmd_scale_x_, cmd_scale_x_);
     target_vel_raw_y_ = DyrosMath::minmax_cut(axis_val(0) * cmd_scale_y_, -cmd_scale_y_, cmd_scale_y_);
     target_vel_raw_yaw_ = DyrosMath::minmax_cut(axis_val(3) * cmd_scale_yaw_, -cmd_scale_yaw_, cmd_scale_yaw_);
+    ignore_stale_keyboard_cmd_ = false;
 }
 
 void CustomController::keyboardCmdCallback(const std_msgs::Float32MultiArray::ConstPtr& msg)
@@ -3554,20 +3598,44 @@ void CustomController::keyboardCmdCallback(const std_msgs::Float32MultiArray::Co
     {
         return;
     }
+    const double cmd_x = DyrosMath::minmax_cut(msg->data[0], -cmd_scale_x_, cmd_scale_x_);
+    const double cmd_y = DyrosMath::minmax_cut(msg->data[1], -cmd_scale_y_, cmd_scale_y_);
+    const double cmd_yaw = DyrosMath::minmax_cut(msg->data[2], -cmd_scale_yaw_, cmd_scale_yaw_);
+
     if (cmd_zero_lock_)
     {
+        // While stop-lock is active, keep tracking the upstream keyboard accumulator
+        // and force local command to zero. On resume, unchanged buffered command is ignored.
+        stale_keyboard_cmd_x_ = cmd_x;
+        stale_keyboard_cmd_y_ = cmd_y;
+        stale_keyboard_cmd_yaw_ = cmd_yaw;
+        ignore_stale_keyboard_cmd_ = true;
         target_vel_raw_x_ = 0.0;
         target_vel_raw_y_ = 0.0;
         target_vel_raw_yaw_ = 0.0;
-        target_vel_x_ = 0.0;
-        target_vel_y_ = 0.0;
-        target_vel_yaw_ = 0.0;
         return;
     }
 
-    target_vel_raw_x_ = DyrosMath::minmax_cut(msg->data[0], -cmd_scale_x_, cmd_scale_x_);
-    target_vel_raw_y_ = DyrosMath::minmax_cut(msg->data[1], -cmd_scale_y_, cmd_scale_y_);
-    target_vel_raw_yaw_ = DyrosMath::minmax_cut(msg->data[2], -cmd_scale_yaw_, cmd_scale_yaw_);
+    if (ignore_stale_keyboard_cmd_)
+    {
+        constexpr double kEps = 1.0e-6;
+        const bool changed =
+            (std::abs(cmd_x - stale_keyboard_cmd_x_) > kEps) ||
+            (std::abs(cmd_y - stale_keyboard_cmd_y_) > kEps) ||
+            (std::abs(cmd_yaw - stale_keyboard_cmd_yaw_) > kEps);
+        if (!changed)
+        {
+            target_vel_raw_x_ = 0.0;
+            target_vel_raw_y_ = 0.0;
+            target_vel_raw_yaw_ = 0.0;
+            return;
+        }
+        ignore_stale_keyboard_cmd_ = false;
+    }
+
+    target_vel_raw_x_ = cmd_x;
+    target_vel_raw_y_ = cmd_y;
+    target_vel_raw_yaw_ = cmd_yaw;
 }
 
 void CustomController::quatToTanNorm(const Eigen::Quaterniond& quaternion, Eigen::Vector3d& tangent, Eigen::Vector3d& normal) {

@@ -237,8 +237,14 @@ public:
     double target_vel_raw_y_ = 0.0;
     double target_vel_raw_yaw_ = 0.0;
     double cmd_ema_window_s_ = 0.2;
+    double cmd_zero_decay_tau_s_ = 0.4;
     int64_t cmd_ema_last_us_ = 0;
     bool cmd_ema_initialized_ = false;
+    int cmd_resume_zero_hold_ticks_ = 0;
+    bool ignore_stale_keyboard_cmd_ = false;
+    double stale_keyboard_cmd_x_ = 0.0;
+    double stale_keyboard_cmd_y_ = 0.0;
+    double stale_keyboard_cmd_yaw_ = 0.0;
 
     float desired_vel_x = 0.0;
     float desired_vel_yaw = 0.0;
