@@ -107,6 +107,7 @@ public:
 
     // ArmActor obs: 3(base ang vel) + 3(gravity) + 8(q) + 8(qdot) + 8(last) + 3(CAM) + 3(CAM_des)
     static const int num_arm_state = 36;
+    static const int num_arm_internal_state = num_arm_state - num_arm_action;
 
     Eigen::MatrixXd rl_action_, rl_action_pre_, torq_diff_, energy;
     Eigen::Matrix<double, num_arm_action, 1> rl_action_arm_, rl_action_arm_pre_;
@@ -168,7 +169,8 @@ public:
     bool obs_history_layout_warned_ = false;
     std::array<std::array<double, 2>, num_actuator_action> leg_joint_pos_limits_;
     std::array<std::array<double, 2>, num_arm_action> arm_joint_pos_limits_;
-    std::string policy_with_arm_path_;
+    std::string policy_with_arm_leg_path_;
+    std::string policy_with_arm_arm_path_;
     std::string policy_without_arm_path_;
     // Joystick
     ros::NodeHandle nh_;
@@ -227,6 +229,10 @@ public:
     int64_t base_ang_vel_lpf_last_us_ = 0;
     Eigen::Vector3d cam_bf_;
     Eigen::Vector3d cam_des_bf_;
+    Eigen::Vector6d cm_world_full_ = Eigen::Vector6d::Zero();
+    Eigen::Vector6d cm_bf_full_ = Eigen::Vector6d::Zero();
+    Eigen::Vector6d cm_des_world_full_ = Eigen::Vector6d::Zero();
+    Eigen::Vector6d cm_des_bf_full_ = Eigen::Vector6d::Zero();
 
     Eigen::Matrix<double, 12, 12> action_offset_, 
                                   action_scale_;
@@ -268,6 +274,7 @@ public:
 
     Eigen::Matrix<double, num_action, 1> action_rate_;
     std::deque<std::vector<float>> leg_hist_core_queue_;
+    std::deque<std::vector<float>> arm_hist_core_queue_;
 
     bool pace_trigger_ = false;
     bool pace_active_ = false;
@@ -354,6 +361,16 @@ public:
     size_t test_obs_sim_step_ = 0;
     bool test_obs_sim_done_ = false;
     size_t test_obs_sim_max_steps_ = 1000;
+    std::ofstream test_arm_obs_action_file_;
+    std::string test_arm_obs_action_name_ = "arm_obs_action_sim.csv";
+    size_t test_arm_obs_action_step_ = 0;
+    size_t test_arm_obs_action_max_rows_ = 50;
+    bool test_arm_obs_action_done_ = false;
+    std::ofstream test_cam_compare_file_;
+    std::string test_cam_compare_name_ = "cam_compare_sim.csv";
+    size_t test_cam_compare_step_ = 0;
+    size_t test_cam_compare_max_rows_ = 1000;
+    bool test_cam_compare_done_ = false;
 
     bool se_log_active_ = false;
     size_t se_log_step_ = 0;

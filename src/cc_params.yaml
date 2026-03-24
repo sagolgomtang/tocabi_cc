@@ -1,11 +1,9 @@
 tocabi_cc:
   # Policy selection
-  use_arm_policy: false
+  use_arm_policy: true
   policy_without_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/without_arm_hist/2026-03-09_13-27-45_model_30000_leg.onnx
-  policy_with_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/2026-02-19_10-41-28_model_500_leg.onnx
-  
-  using step: [ 1, 2, 3, 4, 5,]
-
+  policy_with_arm_leg: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/leg/2026-03-20_11-40-28_model_30000_leg.onnx
+  policy_with_arm_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/arm/2026-03-20_11-40-28_model_30000_arm.onnx
   # Observation options
   include_cam_obs: false
   use_obs_history_layout: true
@@ -16,9 +14,9 @@ tocabi_cc:
   policy_hz: 50.0
   phase_period: 1.6
   phase_offset: 0.0
-  cmd_scale_x: 0.25  # max 0.5
+  cmd_scale_x: 0.50  # max 0.5
   cmd_scale_y: 0.2   # max 0.2
-  cmd_scale_yaw: 0.3 # max 0.6
+  cmd_scale_yaw: 0.6 # max 0.6
   cmd_ema_window_s: 0.2
   cmd_zero_decay_tau_s: 0.4
   joystick_deadzone: 0.1
@@ -31,13 +29,13 @@ tocabi_cc:
   # Joint mapping / controller defaults
   leg_joint_pos_limits:
     - [-0.3, 0.3]
-    - [-0.5, 0.5]
+    - [-1.0, 1.0]
     - [-1.0, 0.5]
     - [-0.3, 1.5]
     - [-0.8, 0.5]
     - [-0.6, 0.6]
     - [-0.3, 0.3]
-    - [-0.5, 0.5]
+    - [-1.0, 1.0]
     - [-1.0, 0.5]
     - [-0.3, 1.5]
     - [-0.8, 0.5]
@@ -46,12 +44,13 @@ tocabi_cc:
   arm_joint_pos_limits:
     - [-0.1, 0.7]
     - [-0.2, 0.8]
-    - [0.75, 1.6]
+    - [1.4, 1.6]
     - [-1.5, -0.5]
     - [-0.7, 0.1]
     - [-0.8, 0.2]
-    - [-1.6, -0.75]
+    - [-1.6, -1.4]
     - [0.5, 1.5]
+
 
   torque_bound: [333, 232, 263, 289, 222, 166, 
                  333, 232, 263, 289, 222, 166, 

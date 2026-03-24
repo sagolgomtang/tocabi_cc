@@ -35,16 +35,37 @@ constexpr int kArmJointMapAction[CustomController::num_arm_action] = {
     15, 16, 17, 19,  // L_Shoulder1,2,3, Elbow
     25, 26, 27, 29   // R_Shoulder1,2,3, Elbow
 };
+// Arm actor observation in IsaacLab uses actuator regex order:
+// Shoulder1(L,R), Shoulder2(L,R), Shoulder3(L,R), Elbow(L,R)
+constexpr int kArmJointMapObs[CustomController::num_arm_action] = {
+    15, 25, 16, 26, 17, 27, 19, 29
+};
+
+constexpr int kLeftWrist1Joint = 21;
+constexpr int kRightWrist1Joint = 31;
 
 constexpr std::array<std::array<double, 2>, CustomController::num_actuator_action> kLegJointPosLimits = {{
+    // {-0.3, 0.3},
+    // {-0.5, 0.5},
+    // {-1.0, 0.5},
+    // {-0.3, 1.5},
+    // {-0.8, 0.5},
+    // {-0.6, 0.6},
+    // {-0.3, 0.3},	
+    // {-0.5, 0.5},
+    // {-1.0, 0.5},
+    // {-0.3, 1.5},
+    // {-0.8, 0.5},
+    // {-0.6, 0.6},
+
     {-0.3, 0.3},
-    {-0.5, 0.5},
+    {-1.0, 1.0},
     {-1.0, 0.5},
     {-0.3, 1.5},
     {-0.8, 0.5},
     {-0.6, 0.6},
     {-0.3, 0.3},	
-    {-0.5, 0.5},
+    {-1.0, 1.0},
     {-1.0, 0.5},
     {-0.3, 1.5},
     {-0.8, 0.5},
@@ -249,7 +270,8 @@ CustomController::CustomController(RobotData &rd)
     if (cc_cfg)
     {
         if (cc_cfg["use_arm_policy"]) use_arm_policy_ = cc_cfg["use_arm_policy"].as<bool>();
-        if (cc_cfg["policy_with_arm"]) policy_with_arm_path_ = cc_cfg["policy_with_arm"].as<std::string>();
+        if (cc_cfg["policy_with_arm_leg"]) policy_with_arm_leg_path_ = cc_cfg["policy_with_arm_leg"].as<std::string>();
+        if (cc_cfg["policy_with_arm_arm"]) policy_with_arm_arm_path_ = cc_cfg["policy_with_arm_arm"].as<std::string>();
         if (cc_cfg["policy_without_arm"]) policy_without_arm_path_ = cc_cfg["policy_without_arm"].as<std::string>();
         if (cc_cfg["include_cam_obs"]) include_cam_obs_ = cc_cfg["include_cam_obs"].as<bool>();
         else include_cam_obs_ = use_arm_policy_;
@@ -297,9 +319,9 @@ CustomController::CustomController(RobotData &rd)
 
     if (use_arm_policy_)
     {
-        if (!policy_with_arm_path_.empty())
+        if (!policy_with_arm_leg_path_.empty())
         {
-            weight_dir_ = policy_with_arm_path_;
+            weight_dir_ = policy_with_arm_leg_path_;
         }
     }
     else
@@ -311,24 +333,21 @@ CustomController::CustomController(RobotData &rd)
     }
     if (weight_dir_.empty())
     {
-        ROS_ERROR_STREAM("[ONNX] Policy path is empty. Set policy_with_arm and policy_without_arm in " << cc_cfg_path);
+        ROS_ERROR_STREAM("[ONNX] Leg policy path is empty. Set policy_with_arm_leg / policy_without_arm in " << cc_cfg_path);
     }
     if (use_arm_policy_)
     {
-        arm_weight_dir_ = weight_dir_;
-        if (!arm_weight_dir_.empty())
+        if (!policy_with_arm_arm_path_.empty())
         {
-            const std::string suffix = "_leg.onnx";
-            if (arm_weight_dir_.size() >= suffix.size() &&
-                arm_weight_dir_.compare(arm_weight_dir_.size() - suffix.size(), suffix.size(), suffix) == 0)
-            {
-                arm_weight_dir_.replace(arm_weight_dir_.size() - suffix.size(), suffix.size(), "_arm.onnx");
-            }
-            else if (arm_weight_dir_.size() >= 5 &&
-                     arm_weight_dir_.compare(arm_weight_dir_.size() - 5, 5, ".onnx") == 0)
-            {
-                arm_weight_dir_.replace(arm_weight_dir_.size() - 5, 5, "_arm.onnx");
-            }
+            arm_weight_dir_ = policy_with_arm_arm_path_;
+        }
+        else
+        {
+            arm_weight_dir_.clear();
+        }
+        if (arm_weight_dir_.empty())
+        {
+            ROS_ERROR_STREAM("[ONNX] Arm policy path is empty. Set policy_with_arm_arm in " << cc_cfg_path);
         }
     }
     if (is_write_file_)
@@ -409,6 +428,241 @@ CustomController::CustomController(RobotData &rd)
     if (use_arm_policy_)
     {
         loadArmOnnX();
+        // Temporary offline parity check: replay IsaacLab arm obs from CSV and compare ONNX action.
+        auto run_arm_csv_parity_check = [&]() {
+            const std::string csv_path =
+                "/home/user/tocabi_mujoco_ws/src/tocabi_cc/test_log/2026-03-16_13-49-52_model_8000_arm_obs_action.csv";
+            if (!std::filesystem::exists(csv_path))
+            {
+                ROS_WARN_STREAM("[ARM_CSV_CHECK] file not found, skip: " << csv_path);
+                return;
+            }
+            if (arm_input_obs_idx_ < 0 || arm_input_obs_idx_ >= static_cast<int>(arm_input_states_buffer.size()))
+            {
+                ROS_WARN("[ARM_CSV_CHECK] invalid arm_input_obs_idx_, skip.");
+                return;
+            }
+            const size_t obs_dim = arm_input_states_buffer[arm_input_obs_idx_].size();
+            if (obs_dim == 0)
+            {
+                ROS_WARN("[ARM_CSV_CHECK] arm obs dim is zero, skip.");
+                return;
+            }
+
+            std::ifstream in(csv_path);
+            if (!in.is_open())
+            {
+                ROS_WARN_STREAM("[ARM_CSV_CHECK] failed to open: " << csv_path);
+                return;
+            }
+
+            auto split_csv = [](const std::string &line, std::vector<std::string> &tokens) {
+                tokens.clear();
+                std::stringstream ss(line);
+                std::string tok;
+                while (std::getline(ss, tok, ','))
+                {
+                    tokens.push_back(tok);
+                }
+            };
+
+            std::string header_line;
+            if (!std::getline(in, header_line))
+            {
+                ROS_WARN_STREAM("[ARM_CSV_CHECK] empty file: " << csv_path);
+                return;
+            }
+
+            std::vector<std::string> header_tokens;
+            split_csv(header_line, header_tokens);
+            if (header_tokens.empty())
+            {
+                ROS_WARN_STREAM("[ARM_CSV_CHECK] invalid header: " << csv_path);
+                return;
+            }
+
+            std::vector<int> obs_col(obs_dim, -1);
+            std::vector<int> act_col(num_arm_action, -1);
+            for (size_t c = 0; c < header_tokens.size(); ++c)
+            {
+                const std::string &name = header_tokens[c];
+                if (name.rfind("arm_obs_", 0) == 0)
+                {
+                    try
+                    {
+                        const int idx = std::stoi(name.substr(8));
+                        if (idx >= 0 && idx < static_cast<int>(obs_dim) && obs_col[idx] < 0)
+                        {
+                            obs_col[idx] = static_cast<int>(c);
+                        }
+                    }
+                    catch (...) {}
+                }
+                else if (name.rfind("arm_act_", 0) == 0)
+                {
+                    try
+                    {
+                        const int idx = std::stoi(name.substr(8));
+                        if (idx >= 0 && idx < num_arm_action && act_col[idx] < 0)
+                        {
+                            act_col[idx] = static_cast<int>(c);
+                        }
+                    }
+                    catch (...) {}
+                }
+            }
+
+            for (size_t i = 0; i < obs_dim; ++i)
+            {
+                if (obs_col[i] < 0)
+                {
+                    ROS_WARN_STREAM("[ARM_CSV_CHECK] missing arm_obs_" << i << " column, skip.");
+                    return;
+                }
+            }
+            for (int i = 0; i < num_arm_action; ++i)
+            {
+                if (act_col[i] < 0)
+                {
+                    ROS_WARN_STREAM("[ARM_CSV_CHECK] missing arm_act_" << i << " column, skip.");
+                    return;
+                }
+            }
+
+            size_t parse_fail_rows = 0;
+            std::vector<std::string> row_tokens;
+            std::vector<float> obs_first(obs_dim, 0.0f);
+            std::array<double, num_arm_action> gt_row1{};
+            std::array<double, num_arm_action> gt_row2{};
+            bool got_row1 = false;
+            bool got_row2 = false;
+            size_t row_idx = 0;
+
+            std::string line;
+            while (std::getline(in, line))
+            {
+                if (line.empty()) continue;
+                split_csv(line, row_tokens);
+                ++row_idx;
+
+                bool row_ok = !row_tokens.empty();
+                if (row_ok)
+                {
+                    for (size_t i = 0; i < obs_dim; ++i)
+                    {
+                        const int c = obs_col[i];
+                        if (c < 0 || c >= static_cast<int>(row_tokens.size()))
+                        {
+                            row_ok = false;
+                            break;
+                        }
+                        try
+                        {
+                            if (!got_row1) obs_first[i] = std::stof(row_tokens[c]);
+                        }
+                        catch (...)
+                        {
+                            row_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (!row_ok)
+                {
+                    ++parse_fail_rows;
+                    continue;
+                }
+
+                auto read_gt = [&](std::array<double, num_arm_action> &dst) {
+                    for (int j = 0; j < num_arm_action; ++j)
+                    {
+                        double v = 0.0;
+                        const int c = act_col[j];
+                        if (c >= 0 && c < static_cast<int>(row_tokens.size()))
+                        {
+                            try { v = std::stod(row_tokens[c]); } catch (...) { v = 0.0; }
+                        }
+                        dst[j] = v;
+                    }
+                };
+
+                if (!got_row1)
+                {
+                    read_gt(gt_row1);
+                    got_row1 = true;
+                    continue;
+                }
+                read_gt(gt_row2);
+                got_row2 = true;
+                break;
+            }
+
+            if (!got_row1)
+            {
+                ROS_WARN_STREAM("[ARM_CSV_CHECK] no valid row found. parse_fail_rows=" << parse_fail_rows);
+                return;
+            }
+
+            std::copy(obs_first.begin(), obs_first.end(), arm_input_states_buffer[arm_input_obs_idx_].begin());
+            auto out = arm_session.Run(Ort::RunOptions{nullptr},
+                                       arm_input_names_char.data(),
+                                       arm_input_tensors.data(),
+                                       arm_input_number,
+                                       arm_output_names_char.data(),
+                                       arm_output_number);
+            if (out.empty() || !out[0].IsTensor())
+            {
+                ROS_WARN("[ARM_CSV_CHECK] arm_session output invalid.");
+                return;
+            }
+            const float *pred_raw = out[0].GetTensorMutableData<float>();
+
+            std::array<double, num_arm_action> pred_vec{};
+            std::array<double, num_arm_action> err_same{};
+            std::array<double, num_arm_action> err_shift{};
+            double mae_same = 0.0;
+            double mae_shift = 0.0;
+            for (int j = 0; j < num_arm_action; ++j)
+            {
+                pred_vec[j] = static_cast<double>(pred_raw[j]);
+                err_same[j] = std::abs(pred_vec[j] - gt_row1[j]);
+                mae_same += err_same[j];
+                if (got_row2)
+                {
+                    err_shift[j] = std::abs(pred_vec[j] - gt_row2[j]);
+                    mae_shift += err_shift[j];
+                }
+            }
+            mae_same /= static_cast<double>(num_arm_action);
+            if (got_row2) mae_shift /= static_cast<double>(num_arm_action);
+
+            auto arr_to_str = [&](const auto &arr) {
+                std::ostringstream ss;
+                ss << std::fixed << std::setprecision(6) << "[";
+                for (size_t i = 0; i < arr.size(); ++i)
+                {
+                    if (i > 0) ss << ", ";
+                    ss << arr[i];
+                }
+                ss << "]";
+                return ss.str();
+            };
+
+            ROS_INFO_STREAM("[ARM_CSV_CHECK_FIRST] joint_order=[L_Sh1,L_Sh2,L_Sh3,L_Elb,R_Sh1,R_Sh2,R_Sh3,R_Elb]"
+                            << " pred_raw=" << arr_to_str(pred_vec)
+                            << " gt_row1=" << arr_to_str(gt_row1)
+                            << " abs_err_row1=" << arr_to_str(err_same)
+                            << " mae_row1=" << mae_same);
+            if (got_row2)
+            {
+                ROS_INFO_STREAM("[ARM_CSV_CHECK_SHIFT] joint_order=[L_Sh1,L_Sh2,L_Sh3,L_Elb,R_Sh1,R_Sh2,R_Sh3,R_Elb]"
+                                << " gt_row2=" << arr_to_str(gt_row2)
+                                << " abs_err_row2=" << arr_to_str(err_shift)
+                                << " mae_row2=" << mae_shift
+                                << " (play_modular dump offset test)");
+            }
+        };
+        run_arm_csv_parity_check();
     }
 
     if (!direct_joystick_enabled_)
@@ -450,6 +704,7 @@ void CustomController::initVariable()
     energy.setZero();
     action_rate_.setZero();
     leg_hist_core_queue_.clear();
+    arm_hist_core_queue_.clear();
     obs_history_layout_warned_ = false;
     rl_action_arm_.setZero();
     rl_action_arm_pre_.setZero();
@@ -898,6 +1153,7 @@ void CustomController::processObservation()
     q.w() = rd_cc_.q_virtual_(MODEL_DOF_QVIRTUAL-1);
 
     euler_angle_ = DyrosMath::rot2Euler_tf(q.toRotationMatrix());
+    ROS_INFO_STREAM_THROTTLE(1.0, "[BASE_HEIGHT] z=" << rd_cc_.q_virtual_(2));
 
     // base_lin_vel (body frame)
     Eigen::Vector3d base_lin_vel_bf;
@@ -1153,75 +1409,44 @@ void CustomController::processObservation()
     // CAM (centroidal angular momentum, body frame) + desired CAM
     if (include_cam_obs_ || use_arm_policy_)
     {
-        Eigen::Vector6d cm = rd_cc_.CMM * rd_cc_.q_dot_virtual_;
-        Eigen::Vector6d cm_des = Eigen::Vector6d::Zero();
-// #ifdef TOCABI_CC_USE_CASADI
-//         if (use_casadi_cam_ && casadi_cam_ready_)
-//         {
-//             try
-//             {
-//                 std::vector<double> q_vec(MODEL_DOF_QVIRTUAL);
-//                 std::vector<double> qdot_vec(MODEL_DOF_VIRTUAL);
-//                 for (int i = 0; i < MODEL_DOF_QVIRTUAL; ++i)
-//                 {
-//                     q_vec[i] = rd_cc_.q_virtual_(i);
-//                 }
-//                 for (int i = 0; i < MODEL_DOF_VIRTUAL; ++i)
-//                 {
-//                     qdot_vec[i] = rd_cc_.q_dot_virtual_(i);
-//                 }
-//                 casadi::DM q_dm(q_vec);
-//                 casadi::DM qdot_dm(qdot_vec);
-//                 std::vector<casadi::DM> out = cmm_fn_(std::vector<casadi::DM>{q_dm});
-//                 if (!out.empty())
-//                 {
-//                     casadi::DM cmm_dm = out[0];
-//                     casadi::DM cm_dm = casadi::mtimes(cmm_dm, qdot_dm);
-//                     for (int i = 0; i < 6; ++i)
-//                     {
-//                         cm(i) = static_cast<double>(cm_dm(i));
-//                     }
-//                     casadi::DM vdes_dm = casadi::DM::zeros(qdot_dm.size1(), qdot_dm.size2());
-//                     vdes_dm(0) = target_vel_x_;
-//                     vdes_dm(1) = target_vel_y_;
-//                     vdes_dm(5) = target_vel_yaw_;
-//                     casadi::DM cm_des_dm = casadi::mtimes(cmm_dm, vdes_dm);
-//                     for (int i = 0; i < 6; ++i)
-//                     {
-//                         cm_des(i) = static_cast<double>(cm_des_dm(i));
-//                     }
-//                 }
-//             }
-//             catch (const std::exception &e)
-//             {
-//                 ROS_WARN_STREAM_THROTTLE(1.0, "CasADi CAM eval failed: " << e.what());
-//             }
-//         }
-// #endif
-        // if (!use_casadi_cam_ || !casadi_cam_ready_)
-        // {
-        //     Eigen::VectorXd vdes = Eigen::VectorXd::Zero(MODEL_DOF_VIRTUAL);
-        //     vdes(0) = target_vel_x_;
-        //     vdes(1) = target_vel_y_;
-        //     vdes(5) = target_vel_yaw_;
-        //     cm_des = rd_cc_.CMM * vdes;
-        // }
-        // Eigen::Matrix3d Rwb = q.toRotationMatrix();
-        // Eigen::Matrix3d Rbw = Rwb.transpose();
-        // Eigen::Vector6d cm_bf;
-        // Eigen::Vector6d cm_des_bf;
-        // cm_bf.head<3>() = Rbw * cm.head<3>();
-        // cm_bf.tail<3>() = Rbw * cm.tail<3>();
-        // cm_des_bf.head<3>() = Rbw * cm_des.head<3>();
-        // cm_des_bf.tail<3>() = Rbw * cm_des.tail<3>();
-        // cam_bf_ = cm_bf.tail<3>();
-        // cam_des_bf_ = cm_des_bf.tail<3>();
-        // if (include_cam_obs_)
-        // {
-        //     state_cur_[data_idx++] = cam_bf_(0);
-        //     state_cur_[data_idx++] = cam_bf_(1);
-        //     state_cur_[data_idx++] = cam_bf_(2);
-        // }
+        cam_bf_.setZero();
+        cam_des_bf_.setZero();
+        cm_world_full_.setZero();
+        cm_bf_full_.setZero();
+        cm_des_world_full_.setZero();
+        cm_des_bf_full_.setZero();
+        if (rd_cc_.CMM.rows() >= 6 && rd_cc_.CMM.cols() >= MODEL_DOF_VIRTUAL &&
+            rd_cc_.q_dot_virtual_.size() >= MODEL_DOF_VIRTUAL)
+        {
+            const Eigen::Matrix<double, 6, Eigen::Dynamic> cmm = rd_cc_.CMM.topRows<6>();
+            const Eigen::VectorXd v = rd_cc_.q_dot_virtual_.segment(0, MODEL_DOF_VIRTUAL);
+            Eigen::VectorXd v_des = Eigen::VectorXd::Zero(MODEL_DOF_VIRTUAL);
+            // Match training-side gen_vel_body_pin_des construction:
+            // desired base velocity is written directly on (vx, vy, wz) without controller EMA.
+            v_des(0) = target_vel_raw_x_;
+            v_des(1) = target_vel_raw_y_;
+            v_des(5) = target_vel_raw_yaw_;
+
+            const Eigen::Vector6d cm = cmm * v;
+            const Eigen::Vector6d cm_des = cmm * v_des;
+
+            // Convert CM / CM_des to body frame.
+            const Eigen::Matrix3d Rbw = q.toRotationMatrix().transpose();
+            Eigen::Vector6d cm_bf;
+            Eigen::Vector6d cm_des_bf;
+            cm_bf.head<3>() = Rbw * cm.head<3>();
+            cm_bf.tail<3>() = Rbw * cm.tail<3>();
+            cm_des_bf.head<3>() = Rbw * cm_des.head<3>();
+            cm_des_bf.tail<3>() = Rbw * cm_des.tail<3>();
+            cm_world_full_ = cm;
+            cm_bf_full_ = cm_bf;
+            cm_des_world_full_ = cm_des;
+            cm_des_bf_full_ = cm_des_bf;
+            // Match IsaacLab mixed convention:
+            //   x,y = angular momentum in body frame, z = angular momentum in world frame.
+            cam_bf_ << cm_bf(3), cm_bf(4), cm(5);
+            cam_des_bf_ << cm_des_bf(3), cm_des_bf(4), cm_des(5);
+        }
     }
 
     if (se_log_active_ && se_log_file_.is_open())
@@ -1465,6 +1690,13 @@ void CustomController::processObservation()
 void CustomController::processArmObservation()
 {
     int data_idx = 0;
+    std::array<float, 3> arm_base_ang_cur = {0.0f, 0.0f, 0.0f};
+    std::array<float, 3> arm_gravity_cur = {0.0f, 0.0f, 0.0f};
+    std::array<float, num_arm_action> arm_joint_pos_cur{};
+    std::array<float, num_arm_action> arm_joint_vel_cur{};
+    std::array<float, num_arm_action> arm_last_action_cur{};
+    std::array<float, 3> arm_cam_cur = {0.0f, 0.0f, 0.0f};
+    std::array<float, 3> arm_cam_des_cur = {0.0f, 0.0f, 0.0f};
 
     Eigen::Quaterniond q;
     q.x() = rd_cc_.q_virtual_(3);
@@ -1486,30 +1718,40 @@ void CustomController::processArmObservation()
     arm_state_cur_[data_idx++] = base_ang_vel_bf_lpf_(0);
     arm_state_cur_[data_idx++] = base_ang_vel_bf_lpf_(1);
     arm_state_cur_[data_idx++] = base_ang_vel_bf_lpf_(2);
+    arm_base_ang_cur[0] = static_cast<float>(base_ang_vel_bf_lpf_(0));
+    arm_base_ang_cur[1] = static_cast<float>(base_ang_vel_bf_lpf_(1));
+    arm_base_ang_cur[2] = static_cast<float>(base_ang_vel_bf_lpf_(2));
 
     // projected_gravity (body frame)
     Eigen::Vector3d gravity_bf = quatRotateInverse(q, Eigen::Vector3d(0.0, 0.0, -1.0));
     arm_state_cur_[data_idx++] = gravity_bf(0);
     arm_state_cur_[data_idx++] = gravity_bf(1);
     arm_state_cur_[data_idx++] = gravity_bf(2);
+    arm_gravity_cur[0] = static_cast<float>(gravity_bf(0));
+    arm_gravity_cur[1] = static_cast<float>(gravity_bf(1));
+    arm_gravity_cur[2] = static_cast<float>(gravity_bf(2));
 
     // joint_pos (arms)
     for (int i = 0; i < num_arm_action; i++)
     {
-        arm_state_cur_[data_idx++] = q_noise_(kArmJointMapAction[i]);
+        arm_state_cur_[data_idx++] = q_noise_(kArmJointMapObs[i]);
+        arm_joint_pos_cur[i] = static_cast<float>(q_noise_(kArmJointMapObs[i]));
     }
 
     // joint_vel (arms)
     const auto &arm_joint_vel_src = use_obs_joint_vel_lpf_ ? q_dot_lpf_ : q_vel_noise_;
     for (int i = 0; i < num_arm_action; i++)
     {
-        arm_state_cur_[data_idx++] = arm_joint_vel_src(kArmJointMapAction[i]);
+        arm_state_cur_[data_idx++] = arm_joint_vel_src(kArmJointMapObs[i]);
+        arm_joint_vel_cur[i] = static_cast<float>(arm_joint_vel_src(kArmJointMapObs[i]));
     }
 
     // last_arm_action
     for (int i = 0; i < num_arm_action; i++)
     {
-        arm_state_cur_[data_idx++] = DyrosMath::minmax_cut(rl_action_arm_(i), -1.0, 1.0);
+        const float a = static_cast<float>(DyrosMath::minmax_cut(rl_action_arm_(i), -1.0, 1.0));
+        arm_state_cur_[data_idx++] = a;
+        arm_last_action_cur[i] = a;
     }
 
     // CAM + CAM_des (body frame)
@@ -1519,10 +1761,110 @@ void CustomController::processArmObservation()
     arm_state_cur_[data_idx++] = cam_des_bf_(0);
     arm_state_cur_[data_idx++] = cam_des_bf_(1);
     arm_state_cur_[data_idx++] = cam_des_bf_(2);
+    arm_cam_cur[0] = static_cast<float>(cam_bf_(0));
+    arm_cam_cur[1] = static_cast<float>(cam_bf_(1));
+    arm_cam_cur[2] = static_cast<float>(cam_bf_(2));
+    arm_cam_des_cur[0] = static_cast<float>(cam_des_bf_(0));
+    arm_cam_des_cur[1] = static_cast<float>(cam_des_bf_(1));
+    arm_cam_des_cur[2] = static_cast<float>(cam_des_bf_(2));
 
     for (int i = data_idx; i < num_arm_state; ++i)
     {
         arm_state_cur_[i] = 0.0f;
+    }
+
+    // History layout for arm actor follows IsaacLab:
+    // [core_hist (no last_action), current last_action]
+    // core = base_ang_vel(3)+gravity(3)+joint_pos(8)+joint_vel(8)+CAM(3)+CAM_des(3) = 28
+    if (use_obs_history_layout_ && arm_input_obs_idx_ >= 0 &&
+        arm_input_obs_idx_ < static_cast<int>(arm_input_states_buffer.size()))
+    {
+        constexpr size_t kArmCoreDim = static_cast<size_t>(num_arm_internal_state); // 28
+        constexpr size_t kArmCurrOnlyDim = static_cast<size_t>(num_arm_action);      // 8
+        const size_t obs_size = arm_input_states_buffer[arm_input_obs_idx_].size();
+        if (obs_size >= kArmCurrOnlyDim)
+        {
+            const size_t hist_residual = obs_size - kArmCurrOnlyDim;
+            if (hist_residual > 0 && (hist_residual % kArmCoreDim) == 0)
+            {
+                const size_t hist_len = hist_residual / kArmCoreDim;
+                std::vector<float> cur_core(kArmCoreDim, 0.0f);
+                for (size_t i = 0; i < 3; ++i) cur_core[i] = arm_base_ang_cur[i];
+                for (size_t i = 0; i < 3; ++i) cur_core[3 + i] = arm_gravity_cur[i];
+                for (size_t i = 0; i < num_arm_action; ++i) cur_core[6 + i] = arm_joint_pos_cur[i];
+                for (size_t i = 0; i < num_arm_action; ++i) cur_core[14 + i] = arm_joint_vel_cur[i];
+                for (size_t i = 0; i < 3; ++i) cur_core[22 + i] = arm_cam_cur[i];
+                for (size_t i = 0; i < 3; ++i) cur_core[25 + i] = arm_cam_des_cur[i];
+
+                arm_hist_core_queue_.push_back(cur_core);
+                while (arm_hist_core_queue_.size() > hist_len)
+                {
+                    arm_hist_core_queue_.pop_front();
+                }
+
+                auto &dst = arm_input_states_buffer[arm_input_obs_idx_];
+                std::fill(dst.begin(), dst.end(), 0.0f);
+                size_t out = 0;
+                const std::vector<float> &fallback_core =
+                    arm_hist_core_queue_.empty() ? cur_core : arm_hist_core_queue_.back();
+                auto get_hist_core = [&](size_t k_from_now) -> const std::vector<float> & {
+                    if (k_from_now < arm_hist_core_queue_.size())
+                    {
+                        return arm_hist_core_queue_[arm_hist_core_queue_.size() - 1 - k_from_now];
+                    }
+                    return fallback_core;
+                };
+
+                // 1) base_ang_vel history (oldest -> newest)
+                for (size_t h = 0; h < hist_len; ++h)
+                {
+                    const size_t k = hist_len - 1 - h;
+                    const auto &hist = get_hist_core(k);
+                    for (size_t j = 0; j < 3; ++j) dst[out++] = hist[j];
+                }
+                // 2) projected_gravity history (oldest -> newest)
+                for (size_t h = 0; h < hist_len; ++h)
+                {
+                    const size_t k = hist_len - 1 - h;
+                    const auto &hist = get_hist_core(k);
+                    for (size_t j = 0; j < 3; ++j) dst[out++] = hist[3 + j];
+                }
+                // 3) arm joint_pos history (oldest -> newest)
+                for (size_t h = 0; h < hist_len; ++h)
+                {
+                    const size_t k = hist_len - 1 - h;
+                    const auto &hist = get_hist_core(k);
+                    for (size_t j = 0; j < num_arm_action; ++j) dst[out++] = hist[6 + j];
+                }
+                // 4) arm joint_vel history (oldest -> newest)
+                for (size_t h = 0; h < hist_len; ++h)
+                {
+                    const size_t k = hist_len - 1 - h;
+                    const auto &hist = get_hist_core(k);
+                    for (size_t j = 0; j < num_arm_action; ++j) dst[out++] = hist[14 + j];
+                }
+                // 5) current last_arm_action only (task cfg keeps this one-step, no history)
+                for (size_t j = 0; j < kArmCurrOnlyDim; ++j)
+                {
+                    dst[out++] = arm_last_action_cur[j];
+                }
+                // 6) CAM history (oldest -> newest)
+                for (size_t h = 0; h < hist_len; ++h)
+                {
+                    const size_t k = hist_len - 1 - h;
+                    const auto &hist = get_hist_core(k);
+                    for (size_t j = 0; j < 3; ++j) dst[out++] = hist[22 + j];
+                }
+                // 7) CAM_des history (oldest -> newest)
+                for (size_t h = 0; h < hist_len; ++h)
+                {
+                    const size_t k = hist_len - 1 - h;
+                    const auto &hist = get_hist_core(k);
+                    for (size_t j = 0; j < 3; ++j) dst[out++] = hist[25 + j];
+                }
+                return;
+            }
+        }
     }
 
     size_t buffer_size = num_arm_state * num_state_skip * num_state_hist;
@@ -1726,6 +2068,10 @@ void CustomController::feedforwardArmPolicy()
     {
         rl_action_arm_(i) = DyrosMath::minmax_cut(action_data[i], -1.0, 1.0);
     }
+    // Match training action config: keep shoulder1 joints fixed at zero.
+    // arm index 0: L_Shoulder1, arm index 4: R_Shoulder1
+    rl_action_arm_(0) = 0.0;
+    rl_action_arm_(4) = 0.0;
 }
 
 void CustomController::computeSlow()
@@ -1849,6 +2195,7 @@ void CustomController::computeSlow()
             action_rate_timeavg_count_ = 0;
             action_rate_timeavg_last_print_us_ = 0;
             leg_hist_core_queue_.clear();
+            arm_hist_core_queue_.clear();
             test_act_buffer_.clear();
             start_time_ = rd_cc_.control_time_us_;
             phase_started_ = true;
@@ -1856,8 +2203,7 @@ void CustomController::computeSlow()
             phase_time_s_ = 0.0;
             phase_last_update_us_ = rd_cc_.control_time_us_;
             sim_time_prev_s_ = sim_time_s_;
-            q_init_mode7_ = rd_cc_.q_virtual_.segment(6, MODEL_DOF);
-            q_noise_pre_ = q_noise_ = q_init_mode7_;
+            q_noise_pre_ = q_noise_ = rd_cc_.q_virtual_.segment(6, MODEL_DOF);
             time_cur_ = start_time_ / 1e6;
             time_pre_ = time_cur_ - 0.005;
             time_inference_pre_ = rd_cc_.control_time_us_ - (1.0 / policy_hz_) * 1e6;
@@ -1980,6 +2326,13 @@ void CustomController::computeSlow()
                 {
                     processArmObservation();
                     feedforwardArmPolicy();
+                    ROS_INFO_STREAM_THROTTLE(1.0,
+                        "[ARM_DBG] hold=" << (init_pose_hold_active_ ? 1 : 0)
+                        << " act="
+                        << rl_action_arm_(0) << "," << rl_action_arm_(1) << ","
+                        << rl_action_arm_(2) << "," << rl_action_arm_(3) << ","
+                        << rl_action_arm_(4) << "," << rl_action_arm_(5) << ","
+                        << rl_action_arm_(6) << "," << rl_action_arm_(7));
                 }
                 const double policy_elapsed_s =
                     std::chrono::duration_cast<std::chrono::duration<double>>(
@@ -2064,7 +2417,9 @@ void CustomController::computeSlow()
                 }
                 for (int i = num_actuator_action; i < MODEL_DOF; i++)
                 {
-                    torque_rl_(i) = kp_(i, i) * (q_init_mode7_(i) - q_noise_(i)) -
+                    const double hold_target =
+                        (use_arm_policy_ && (i == kLeftWrist1Joint || i == kRightWrist1Joint)) ? 0.0 : q_init_mode7_(i);
+                    torque_rl_(i) = kp_(i, i) * (hold_target - q_noise_(i)) -
                                     kv_(i, i) * (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(i) : q_vel_noise_(i));
                 }
 
@@ -2219,16 +2574,182 @@ void CustomController::computeSlow()
             const size_t hist_len = hist_residual / kHistCoreDim;
             return hist_len;
         };
+        auto get_required_arm_hist_len = [&]() -> size_t {
+            if (!use_obs_history_layout_ || !use_arm_policy_)
+            {
+                return 0;
+            }
+            if (arm_input_obs_idx_ < 0 || arm_input_obs_idx_ >= static_cast<int>(arm_input_states_buffer.size()))
+            {
+                return 0;
+            }
+            constexpr size_t kArmCoreDim = static_cast<size_t>(num_arm_internal_state); // 28
+            constexpr size_t kArmCurrOnlyDim = static_cast<size_t>(num_arm_action);      // 8
+            const size_t obs_size = arm_input_states_buffer[arm_input_obs_idx_].size();
+            if (obs_size < kArmCurrOnlyDim)
+            {
+                return 0;
+            }
+            const size_t hist_residual = obs_size - kArmCurrOnlyDim;
+            if (hist_residual == 0)
+            {
+                return 0;
+            }
+            if (hist_residual % kArmCoreDim != 0)
+            {
+                return 0;
+            }
+            return hist_residual / kArmCoreDim;
+        };
+        auto write_arm_obs_action_row = [&]() {
+            if (!use_arm_policy_ || !test_arm_obs_action_file_.is_open())
+            {
+                return;
+            }
+            if (test_arm_obs_action_done_ || test_arm_obs_action_step_ >= test_arm_obs_action_max_rows_)
+            {
+                if (test_arm_obs_action_file_.is_open())
+                {
+                    test_arm_obs_action_file_.close();
+                }
+                test_arm_obs_action_done_ = true;
+                return;
+            }
+            if (arm_input_obs_idx_ < 0 || arm_input_obs_idx_ >= static_cast<int>(arm_input_states_buffer.size()))
+            {
+                return;
+            }
+            const std::vector<float> &arm_obs = arm_input_states_buffer[arm_input_obs_idx_];
+            if (arm_obs.empty())
+            {
+                return;
+            }
+            test_arm_obs_action_file_ << static_cast<double>(test_arm_obs_action_step_ + 1) << ",";
+            for (size_t i = 0; i < arm_obs.size(); ++i)
+            {
+                test_arm_obs_action_file_ << arm_obs[i] << ",";
+            }
+            for (int i = 0; i < num_arm_action; ++i)
+            {
+                test_arm_obs_action_file_ << static_cast<float>(rl_action_arm_(i));
+                if (i + 1 < num_arm_action)
+                {
+                    test_arm_obs_action_file_ << ",";
+                }
+            }
+            test_arm_obs_action_file_ << "\n";
+            test_arm_obs_action_file_.flush();
+            test_arm_obs_action_step_++;
+            if (test_arm_obs_action_step_ >= test_arm_obs_action_max_rows_)
+            {
+                test_arm_obs_action_file_.close();
+                test_arm_obs_action_done_ = true;
+                ROS_INFO_STREAM("[TEST_LOG] arm obs/action logging reached "
+                                << test_arm_obs_action_max_rows_ << " rows. Closed file.");
+            }
+        };
+        auto write_cam_compare_row = [&]() {
+            if (!test_cam_compare_file_.is_open() || test_cam_compare_done_)
+            {
+                return;
+            }
+            if (test_cam_compare_step_ >= test_cam_compare_max_rows_)
+            {
+                test_cam_compare_file_.close();
+                test_cam_compare_done_ = true;
+                ROS_INFO_STREAM("[TEST_LOG] cam compare logging reached "
+                                << test_cam_compare_max_rows_ << " rows. Closed file.");
+                return;
+            }
+            Eigen::Vector3d qdot_base_lin_bf = Eigen::Vector3d::Zero();
+            Eigen::Vector3d qdot_base_ang_bf = Eigen::Vector3d::Zero();
+            Eigen::Vector3d qdot_local_base_lin_bf = Eigen::Vector3d::Zero();
+            Eigen::Vector3d qdot_local_base_ang_bf = Eigen::Vector3d::Zero();
+            Eigen::Vector3d qdot_lpf_base_lin_bf = Eigen::Vector3d::Zero();
+            Eigen::Vector3d qdot_lpf_base_ang_bf = Eigen::Vector3d::Zero();
+            if (rd_cc_.q_virtual_.size() >= MODEL_DOF_QVIRTUAL)
+            {
+                Eigen::Quaterniond q_truth;
+                q_truth.x() = rd_cc_.q_virtual_(3);
+                q_truth.y() = rd_cc_.q_virtual_(4);
+                q_truth.z() = rd_cc_.q_virtual_(5);
+                q_truth.w() = rd_cc_.q_virtual_(MODEL_DOF_QVIRTUAL - 1);
+                if (rd_cc_.q_dot_virtual_.size() >= MODEL_DOF_VIRTUAL)
+                {
+                    qdot_base_lin_bf = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_.segment(0, 3));
+                    qdot_base_ang_bf = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_.segment(3, 3));
+                }
+                if (rd_cc_.q_dot_virtual_local_.size() >= MODEL_DOF_VIRTUAL)
+                {
+                    qdot_local_base_lin_bf = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_local_.segment(0, 3));
+                    qdot_local_base_ang_bf = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_local_.segment(3, 3));
+                }
+                if (rd_cc_.q_dot_virtual_lpf.size() >= MODEL_DOF_VIRTUAL)
+                {
+                    qdot_lpf_base_lin_bf = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_lpf.segment(0, 3));
+                    qdot_lpf_base_ang_bf = quatRotateInverse(q_truth, rd_cc_.q_dot_virtual_lpf.segment(3, 3));
+                }
+            }
+            test_cam_compare_file_
+                << static_cast<double>(test_cam_compare_step_ + 1) << ","
+                << target_vel_raw_x_ << "," << target_vel_raw_y_ << "," << target_vel_raw_yaw_ << ","
+                << target_vel_x_ << "," << target_vel_y_ << "," << target_vel_yaw_ << ","
+                << cam_bf_(0) << "," << cam_bf_(1) << "," << cam_bf_(2) << ","
+                << cam_des_bf_(0) << "," << cam_des_bf_(1) << "," << cam_des_bf_(2) << ","
+                << rd_cc_.q_dot_virtual_(0) << "," << rd_cc_.q_dot_virtual_(1) << "," << rd_cc_.q_dot_virtual_(2) << ","
+                << rd_cc_.q_dot_virtual_(3) << "," << rd_cc_.q_dot_virtual_(4) << "," << rd_cc_.q_dot_virtual_(5) << ","
+                << qdot_base_lin_bf(0) << "," << qdot_base_lin_bf(1) << "," << qdot_base_lin_bf(2) << ","
+                << qdot_base_ang_bf(0) << "," << qdot_base_ang_bf(1) << "," << qdot_base_ang_bf(2) << ","
+                << qdot_local_base_lin_bf(0) << "," << qdot_local_base_lin_bf(1) << "," << qdot_local_base_lin_bf(2) << ","
+                << qdot_local_base_ang_bf(0) << "," << qdot_local_base_ang_bf(1) << "," << qdot_local_base_ang_bf(2) << ","
+                << qdot_lpf_base_lin_bf(0) << "," << qdot_lpf_base_lin_bf(1) << "," << qdot_lpf_base_lin_bf(2) << ","
+                << qdot_lpf_base_ang_bf(0) << "," << qdot_lpf_base_ang_bf(1) << "," << qdot_lpf_base_ang_bf(2) << ",";
+            for (int i = 0; i < 6; ++i)
+            {
+                test_cam_compare_file_ << cm_world_full_(i) << ",";
+            }
+            for (int i = 0; i < 6; ++i)
+            {
+                test_cam_compare_file_ << cm_bf_full_(i) << ",";
+            }
+            for (int i = 0; i < 6; ++i)
+            {
+                test_cam_compare_file_ << cm_des_world_full_(i) << ",";
+            }
+            for (int i = 0; i < 6; ++i)
+            {
+                test_cam_compare_file_ << cm_des_bf_full_(i);
+                if (i + 1 < 6)
+                {
+                    test_cam_compare_file_ << ",";
+                }
+            }
+            test_cam_compare_file_ << "\n";
+            test_cam_compare_file_.flush();
+            test_cam_compare_step_++;
+            if (test_cam_compare_step_ >= test_cam_compare_max_rows_)
+            {
+                test_cam_compare_file_.close();
+                test_cam_compare_done_ = true;
+                ROS_INFO_STREAM("[TEST_LOG] cam compare logging reached "
+                                << test_cam_compare_max_rows_ << " rows. Closed file.");
+            }
+        };
         if (mode7_rising)
         {
             test_log_step_ = 0;
             test_policy_step_ = 0;
+            test_arm_obs_action_step_ = 0;
+            test_arm_obs_action_done_ = false;
+            test_cam_compare_step_ = 0;
+            test_cam_compare_done_ = false;
             test_action_rate_stats_last_valid_ = false;
             action_rate_timeavg_sum_mean_ = 0.0;
             action_rate_timeavg_sum_max_ = 0.0;
             action_rate_timeavg_count_ = 0;
             action_rate_timeavg_last_print_us_ = 0;
             leg_hist_core_queue_.clear();
+            arm_hist_core_queue_.clear();
             sim_paused_ = false;
             if (test_act_file_.is_open())
             {
@@ -2248,6 +2769,18 @@ void CustomController::computeSlow()
             }
             test_action_rate_stats_file_.open(test_log_dir_ + "/" + test_action_rate_stats_name_,
                                              std::ofstream::out | std::ofstream::trunc);
+            if (test_arm_obs_action_file_.is_open())
+            {
+                test_arm_obs_action_file_.close();
+            }
+            test_arm_obs_action_file_.open(test_log_dir_ + "/" + test_arm_obs_action_name_,
+                                           std::ofstream::out | std::ofstream::trunc);
+            if (test_cam_compare_file_.is_open())
+            {
+                test_cam_compare_file_.close();
+            }
+            test_cam_compare_file_.open(test_log_dir_ + "/" + test_cam_compare_name_,
+                                        std::ofstream::out | std::ofstream::trunc);
             if (!test_act_file_)
             {
                 ROS_WARN_STREAM("[TEST_LOG] Failed to open " << test_act_runtime_name_ << " in " << test_log_dir_);
@@ -2265,6 +2798,46 @@ void CustomController::computeSlow()
             {
                 test_action_rate_stats_file_ << std::fixed << std::setprecision(6);
                 test_action_rate_stats_file_ << "policy_step,mean_abs,max_abs\n";
+            }
+            if (test_arm_obs_action_file_)
+            {
+                test_arm_obs_action_file_ << std::fixed << std::setprecision(6);
+                if (arm_input_obs_idx_ >= 0 && arm_input_obs_idx_ < static_cast<int>(arm_input_states_buffer.size()))
+                {
+                    const size_t arm_obs_dim = arm_input_states_buffer[arm_input_obs_idx_].size();
+                    test_arm_obs_action_file_ << "step";
+                    for (size_t i = 0; i < arm_obs_dim; ++i)
+                    {
+                        test_arm_obs_action_file_ << ",arm_obs_" << i;
+                    }
+                    for (int i = 0; i < num_arm_action; ++i)
+                    {
+                        test_arm_obs_action_file_ << ",arm_act_" << i;
+                    }
+                    test_arm_obs_action_file_ << "\n";
+                }
+            }
+            if (test_cam_compare_file_)
+            {
+                test_cam_compare_file_ << std::fixed << std::setprecision(6);
+                test_cam_compare_file_
+                    << "step,"
+                    << "cmd_raw_vx,cmd_raw_vy,cmd_raw_wz,"
+                    << "cmd_ema_vx,cmd_ema_vy,cmd_ema_wz,"
+                    << "cam_mix_x,cam_mix_y,cam_mix_z,"
+                    << "cam_des_mix_x,cam_des_mix_y,cam_des_mix_z,"
+                    << "qdot_base_lin_x,qdot_base_lin_y,qdot_base_lin_z,"
+                    << "qdot_base_ang_x,qdot_base_ang_y,qdot_base_ang_z,"
+                    << "qdot_base_bf_lin_x,qdot_base_bf_lin_y,qdot_base_bf_lin_z,"
+                    << "qdot_base_bf_ang_x,qdot_base_bf_ang_y,qdot_base_bf_ang_z,"
+                    << "qdot_local_bf_lin_x,qdot_local_bf_lin_y,qdot_local_bf_lin_z,"
+                    << "qdot_local_bf_ang_x,qdot_local_bf_ang_y,qdot_local_bf_ang_z,"
+                    << "qdot_lpf_bf_lin_x,qdot_lpf_bf_lin_y,qdot_lpf_bf_lin_z,"
+                    << "qdot_lpf_bf_ang_x,qdot_lpf_bf_ang_y,qdot_lpf_bf_ang_z,"
+                    << "cm_w_lin_x,cm_w_lin_y,cm_w_lin_z,cm_w_ang_x,cm_w_ang_y,cm_w_ang_z,"
+                    << "cm_b_lin_x,cm_b_lin_y,cm_b_lin_z,cm_b_ang_x,cm_b_ang_y,cm_b_ang_z,"
+                    << "cm_des_w_lin_x,cm_des_w_lin_y,cm_des_w_lin_z,cm_des_w_ang_x,cm_des_w_ang_y,cm_des_w_ang_z,"
+                    << "cm_des_b_lin_x,cm_des_b_lin_y,cm_des_b_lin_z,cm_des_b_ang_x,cm_des_b_ang_y,cm_des_b_ang_z\n";
             }
             phase_started_ = false;
             phase_time_s_ = 0.0;
@@ -2300,8 +2873,7 @@ void CustomController::computeSlow()
         {
             // Initialize settings for Task Control.
             start_time_ = rd_cc_.control_time_us_;
-            q_init_mode7_ = rd_cc_.q_virtual_.segment(6, MODEL_DOF);
-            q_noise_pre_ = q_noise_ = q_init_mode7_;
+            q_noise_pre_ = q_noise_ = rd_cc_.q_virtual_.segment(6, MODEL_DOF);
             time_cur_ = start_time_ / 1e6;
             time_pre_ = time_cur_ - 0.005;
             time_inference_pre_ = rd_cc_.control_time_us_ - (1.0 / policy_hz_) * 1e6;
@@ -2393,17 +2965,42 @@ void CustomController::computeSlow()
             // }
             const size_t required_hist_len = get_required_leg_hist_len();
             const bool hist_ready = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
+            if (use_arm_policy_)
+            {
+                processArmObservation();
+            }
+            const size_t required_arm_hist_len = get_required_arm_hist_len();
+            const bool arm_hist_ready = (required_arm_hist_len == 0) || (arm_hist_core_queue_.size() >= required_arm_hist_len);
+            if (use_arm_policy_)
+            {
+                const size_t arm_obs_size =
+                    (arm_input_obs_idx_ >= 0 && arm_input_obs_idx_ < static_cast<int>(arm_input_states_buffer.size()))
+                        ? arm_input_states_buffer[arm_input_obs_idx_].size()
+                        : 0;
+                ROS_INFO_STREAM_THROTTLE(1.0,
+                    "[ARM_OBS_DBG] semode=" << (rd_cc_.semode ? 1 : 0)
+                    << " obs_size=" << arm_obs_size
+                    << " hist=" << arm_hist_core_queue_.size() << "/" << required_arm_hist_len
+                    << " cmd_raw=(" << target_vel_raw_x_ << "," << target_vel_raw_y_ << "," << target_vel_raw_yaw_ << ")"
+                    << " cam=(" << cam_bf_(0) << "," << cam_bf_(1) << "," << cam_bf_(2) << ")"
+                    << " cam_des=(" << cam_des_bf_(0) << "," << cam_des_bf_(1) << "," << cam_des_bf_(2) << ")");
+            }
             if (hist_ready)
             {
                 const auto policy_t0 = std::chrono::steady_clock::now();
                 feedforwardPolicy();
                 test_policy_step_++;
                 update_action_rate_time_avg();
-                if (use_arm_policy_)
+                if (use_arm_policy_ && arm_hist_ready)
                 {
-                    processArmObservation();
                     feedforwardArmPolicy();
+                    write_arm_obs_action_row();
                 }
+                else if (use_arm_policy_)
+                {
+                    rl_action_arm_.setZero();
+                }
+                write_cam_compare_row();
                 const double policy_elapsed_s =
                     std::chrono::duration_cast<std::chrono::duration<double>>(
                         std::chrono::steady_clock::now() - policy_t0).count();
@@ -2445,6 +3042,7 @@ void CustomController::computeSlow()
             {
                 // Sim reset detected (time jump backwards): restart like initial mode7 warm-up.
                 leg_hist_core_queue_.clear();
+                arm_hist_core_queue_.clear();
                 rl_action_.setZero();
                 rl_action_pre_.setZero();
                 rl_action_arm_.setZero();
@@ -2460,6 +3058,8 @@ void CustomController::computeSlow()
             // Reset phase and last action on send so the next obs reflects the reset.
             rl_action_.setZero();
             rl_action_pre_.setZero();
+            rl_action_arm_.setZero();
+            rl_action_arm_pre_.setZero();
             phase_started_ = true;
             phase_start_time_s_ = rd_cc_.control_time_us_ / 1.0e6;
             phase_time_s_ = 0.0;
@@ -2498,6 +3098,26 @@ void CustomController::computeSlow()
             // }
             const size_t required_hist_len = get_required_leg_hist_len();
             const bool hist_ready = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
+            if (use_arm_policy_)
+            {
+                processArmObservation();
+            }
+            const size_t required_arm_hist_len = get_required_arm_hist_len();
+            const bool arm_hist_ready = (required_arm_hist_len == 0) || (arm_hist_core_queue_.size() >= required_arm_hist_len);
+            if (use_arm_policy_)
+            {
+                const size_t arm_obs_size =
+                    (arm_input_obs_idx_ >= 0 && arm_input_obs_idx_ < static_cast<int>(arm_input_states_buffer.size()))
+                        ? arm_input_states_buffer[arm_input_obs_idx_].size()
+                        : 0;
+                ROS_INFO_STREAM_THROTTLE(1.0,
+                    "[ARM_OBS_DBG] semode=" << (rd_cc_.semode ? 1 : 0)
+                    << " obs_size=" << arm_obs_size
+                    << " hist=" << arm_hist_core_queue_.size() << "/" << required_arm_hist_len
+                    << " cmd_raw=(" << target_vel_raw_x_ << "," << target_vel_raw_y_ << "," << target_vel_raw_yaw_ << ")"
+                    << " cam=(" << cam_bf_(0) << "," << cam_bf_(1) << "," << cam_bf_(2) << ")"
+                    << " cam_des=(" << cam_des_bf_(0) << "," << cam_des_bf_(1) << "," << cam_des_bf_(2) << ")");
+            }
             if (hist_ready)
             {
                 const auto policy_t0 = std::chrono::steady_clock::now();
@@ -2505,11 +3125,16 @@ void CustomController::computeSlow()
                 mode7_policy_ran_this_tick = true;
                 test_policy_step_++;
                 update_action_rate_time_avg();
-                if (use_arm_policy_)
+                if (use_arm_policy_ && arm_hist_ready)
                 {
-                    processArmObservation();
                     feedforwardArmPolicy();
+                    write_arm_obs_action_row();
                 }
+                else if (use_arm_policy_)
+                {
+                    rl_action_arm_.setZero();
+                }
+                write_cam_compare_row();
                 const double policy_elapsed_s =
                     std::chrono::duration_cast<std::chrono::duration<double>>(
                         std::chrono::steady_clock::now() - policy_t0).count();
@@ -2672,7 +3297,10 @@ void CustomController::computeSlow()
 
         const size_t required_hist_len = get_required_leg_hist_len();
         const bool hist_ready_for_control = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
-        if (!hist_ready_for_control)
+        const size_t required_arm_hist_len_for_control = get_required_arm_hist_len();
+        const bool arm_hist_ready_for_control =
+            (!use_arm_policy_) || (required_arm_hist_len_for_control == 0) || (arm_hist_core_queue_.size() >= required_arm_hist_len_for_control);
+        if (!hist_ready_for_control || !arm_hist_ready_for_control)
         {
             const auto &vel_src = use_dtau_joint_vel_lpf_ ? q_dot_lpf_ : q_vel_noise_;
             rd_.q_desired = q_init_;
@@ -2711,6 +3339,11 @@ void CustomController::computeSlow()
         target_pos_arm.setZero();
         static int target_log_counter = 0;
         rd_.q_desired = q_init_mode7_;
+        if (use_arm_policy_)
+        {
+            rd_.q_desired(kLeftWrist1Joint) = 0.0;
+            rd_.q_desired(kRightWrist1Joint) = 0.0;
+        }
         if (!init_pose_hold_active_)
         {
             for (int i = 0; i < num_actuator_action; i++)
@@ -2747,6 +3380,12 @@ void CustomController::computeSlow()
                     target_pos_arm(i) = target;
                     rd_.q_desired(joint_idx) = target_pos_arm(i);
                 }
+                ROS_INFO_STREAM_THROTTLE(1.0,
+                    "[ARM_DBG] qdes="
+                    << target_pos_arm(0) << "," << target_pos_arm(1) << ","
+                    << target_pos_arm(2) << "," << target_pos_arm(3) << ","
+                    << target_pos_arm(4) << "," << target_pos_arm(5) << ","
+                    << target_pos_arm(6) << "," << target_pos_arm(7));
             }
         }
         // bool log_due = debug_log_this_step_ || ((target_log_counter++ % 100) == 0);
@@ -2780,9 +3419,9 @@ void CustomController::computeSlow()
                 for (int i = 0; i < num_arm_action; i++)
                 {
                     const int joint_idx = kArmJointMapAction[i];
-                    torque_rl_(joint_idx) = kp_(joint_idx, joint_idx) *
+                    torque_rl_(joint_idx) = kp_(joint_idx, joint_idx) / 9.0 *
                                                 (target_pos_arm(i) - q_noise_(joint_idx)) -
-                                            kv_(joint_idx, joint_idx) *
+                                            kv_(joint_idx, joint_idx) / 3.0 *
                                                 (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(joint_idx) : q_vel_noise_(joint_idx));
                 }
             }
@@ -2791,7 +3430,9 @@ void CustomController::computeSlow()
         {
             for (int i = 0; i < MODEL_DOF; i++)
             {
-                torque_rl_(i) = kp_(i, i) * (q_init_mode7_(i) - q_noise_(i)) -
+                const double hold_target =
+                    (use_arm_policy_ && (i == kLeftWrist1Joint || i == kRightWrist1Joint)) ? 0.0 : q_init_mode7_(i);
+                torque_rl_(i) = kp_(i, i) * (hold_target - q_noise_(i)) -
                                 kv_(i, i) * (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(i) : q_vel_noise_(i));
             }
         }
@@ -2826,7 +3467,9 @@ void CustomController::computeSlow()
                     continue;
                 }
             }
-            torque_rl_(i) = kp_(i, i) * (q_init_mode7_(i) - q_noise_(i)) -
+            const double hold_target =
+                (use_arm_policy_ && (i == kLeftWrist1Joint || i == kRightWrist1Joint)) ? 0.0 : q_init_mode7_(i);
+            torque_rl_(i) = kp_(i, i) * (hold_target - q_noise_(i)) -
                             kv_(i, i) * (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(i) : q_vel_noise_(i));
         }
 
@@ -3205,7 +3848,7 @@ void CustomController::guiSendCallback(const std_msgs::Empty::ConstPtr& msg)
 void CustomController::handleMode7ToggleRequest()
 {
     const bool mode_is_7 = (rd_cc_.tc_.mode == 7);
-    if (!mode_is_7 || btn1_gravity_stopped_)
+    if (!mode_is_7)
     {
         init_pose_hold_toggle_request_ = false;
         tocabi_msgs::TaskCommand msg;
@@ -3224,6 +3867,31 @@ void CustomController::handleMode7ToggleRequest()
         cmd_ema_last_us_ = rd_cc_.control_time_us_;
         cmd_resume_zero_hold_ticks_ = 25; // ~0.1s at 250 Hz
         // Keep ignoring stale keyboard command until a changed command arrives.
+        ignore_stale_keyboard_cmd_ = true;
+        std_msgs::String kb_unlock_msg;
+        kb_unlock_msg.data = "keyboard_cmd_unlock";
+        sim_command_pub_.publish(kb_unlock_msg);
+        debug_log_steps_remaining_ = 5;
+        ROS_INFO("[MODE7] Requested return to policy mode.");
+    }
+    else if (btn1_gravity_stopped_)
+    {
+        init_pose_hold_toggle_request_ = false;
+        tocabi_msgs::TaskCommand msg;
+        msg.mode = 7;
+        task_cmd_pub_.publish(msg);
+        mode7_send_triggered_ = true;
+        btn1_gravity_stopped_ = false;
+        cmd_zero_lock_ = false;
+        target_vel_raw_x_ = 0.0;
+        target_vel_raw_y_ = 0.0;
+        target_vel_raw_yaw_ = 0.0;
+        target_vel_x_ = 0.0;
+        target_vel_y_ = 0.0;
+        target_vel_yaw_ = 0.0;
+        cmd_ema_initialized_ = true;
+        cmd_ema_last_us_ = rd_cc_.control_time_us_;
+        cmd_resume_zero_hold_ticks_ = 25; // ~0.1s at 250 Hz
         ignore_stale_keyboard_cmd_ = true;
         std_msgs::String kb_unlock_msg;
         kb_unlock_msg.data = "keyboard_cmd_unlock";
