@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 #include <fcntl.h>
 #include <linux/joystick.h>
 #include <unistd.h>
@@ -18,6 +19,7 @@
 using namespace TOCABI;
 
 namespace {
+bool g_mode7_blend_reseed_pending = false;
 // Legacy single-map (interleaved) for reference:
 // constexpr int kLegJointMap[CustomController::num_actuator_action] = {
 //     0, 6, 1, 7, 2, 8, 3, 9, 4, 10, 5, 11};
@@ -32,17 +34,18 @@ constexpr int kLegJointMapObs[CustomController::num_actuator_action] = {
     0, 6, 1, 7, 2, 8, 3, 9, 4, 10, 5, 11};
 
 constexpr int kArmJointMapAction[CustomController::num_arm_action] = {
-    15, 16, 17, 19,  // L_Shoulder1,2,3, Elbow
-    25, 26, 27, 29   // R_Shoulder1,2,3, Elbow
+    16, 26  // L_Shoulder2, R_Shoulder2
 };
 // Arm actor observation in IsaacLab uses actuator regex order:
 // Shoulder1(L,R), Shoulder2(L,R), Shoulder3(L,R), Elbow(L,R)
-constexpr int kArmJointMapObs[CustomController::num_arm_action] = {
+constexpr int kArmJointMapObs[CustomController::num_arm_obs_joint] = {
     15, 25, 16, 26, 17, 27, 19, 29
 };
 
 constexpr int kLeftWrist1Joint = 21;
 constexpr int kRightWrist1Joint = 31;
+constexpr double kMode7LeftWrist1Target = 0.0;
+constexpr double kMode7RightWrist1Target = 0.0;
 
 constexpr std::array<std::array<double, 2>, CustomController::num_actuator_action> kLegJointPosLimits = {{
     // {-0.3, 0.3},
@@ -73,15 +76,25 @@ constexpr std::array<std::array<double, 2>, CustomController::num_actuator_actio
 }};
 
 constexpr std::array<std::array<double, 2>, CustomController::num_arm_action> kArmJointPosLimits = {{
-    {-0.1, 0.7},
-    {-0.2, 0.8},
-    {0.75, 1.6},
-    {-1.5, -0.5},  // left arms
-    {-0.7, 0.1},
-    {-0.8, 0.2},
-    {-1.6, -0.75},
-    {0.5, 1.5},    // right arms
+    {-0.1, 0.7},  // L_Shoulder2
+    {-0.7, 0.1},  // R_Shoulder2
 }};
+
+template <typename DerivedIn, typename DerivedOut>
+void applyIsaacLabArmActionPostprocess(const Eigen::MatrixBase<DerivedIn> &src,
+                                       Eigen::MatrixBase<DerivedOut> &dst)
+{
+    static_assert(DerivedIn::SizeAtCompileTime == CustomController::num_arm_action ||
+                      DerivedIn::SizeAtCompileTime == Eigen::Dynamic,
+                  "arm action size mismatch");
+    static_assert(DerivedOut::SizeAtCompileTime == CustomController::num_arm_action ||
+                      DerivedOut::SizeAtCompileTime == Eigen::Dynamic,
+                  "arm action size mismatch");
+    for (int i = 0; i < CustomController::num_arm_action; ++i)
+    {
+        dst(i) = DyrosMath::minmax_cut(src(i), -1.0, 1.0);
+    }
+}
 
 template <size_t N>
 bool loadLimits2DYaml(const YAML::Node &cfg, const char *key, std::array<std::array<double, 2>, N> &out)
@@ -104,7 +117,6 @@ bool loadLimits2DYaml(const YAML::Node &cfg, const char *key, std::array<std::ar
     }
     return true;
 }
-
 
 // Arm order (elbow before armlink) for future action/obs mapping.
 constexpr int kArmJointMapUserOrder[16] = {
@@ -234,6 +246,49 @@ void writeObsCsvHeader(std::ofstream &file, size_t obs_size, bool use_obs_histor
 
 }
 
+void CustomController::applyMode7ArmInitPosePreset()
+{
+    q_init_mode7_ = q_init_;
+    // Match Isaac deployment init_state for mode7 warm-up/reset pose.
+    // legs
+    q_init_mode7_(0) = 0.0;     // L_HipYaw
+    q_init_mode7_(1) = 0.0;     // L_HipRoll
+    q_init_mode7_(2) = -0.24;   // L_HipPitch
+    q_init_mode7_(3) = 0.6;     // L_Knee
+    q_init_mode7_(4) = -0.36;   // L_AnklePitch
+    q_init_mode7_(5) = 0.0;     // L_AnkleRoll
+    q_init_mode7_(6) = 0.0;     // R_HipYaw
+    q_init_mode7_(7) = 0.0;     // R_HipRoll
+    q_init_mode7_(8) = -0.24;   // R_HipPitch
+    q_init_mode7_(9) = 0.6;     // R_Knee
+    q_init_mode7_(10) = -0.36;  // R_AnklePitch
+    q_init_mode7_(11) = 0.0;    // R_AnkleRoll
+    // trunk
+    q_init_mode7_(12) = 0.0;    // Waist1
+    q_init_mode7_(13) = 0.0;    // Waist2
+    q_init_mode7_(14) = 0.0;    // Upperbody
+    // left arm + neck/head
+    q_init_mode7_(15) = 0.0;    // L_Shoulder1
+    q_init_mode7_(16) = 0.5;    // L_Shoulder2
+    q_init_mode7_(17) = 1.5;    // L_Shoulder3
+    q_init_mode7_(18) = -1.57;  // L_Armlink
+    q_init_mode7_(19) = -1.0;   // L_Elbow
+    q_init_mode7_(20) = 0.0;    // L_Forearm
+    q_init_mode7_(21) = kMode7LeftWrist1Target;   // L_Wrist1
+    q_init_mode7_(22) = 0.0;    // L_Wrist2
+    q_init_mode7_(23) = 0.0;    // Neck
+    q_init_mode7_(24) = 0.0;    // Head
+    // right arm
+    q_init_mode7_(25) = 0.0;    // R_Shoulder1
+    q_init_mode7_(26) = -0.5;   // R_Shoulder2
+    q_init_mode7_(27) = -1.5;   // R_Shoulder3
+    q_init_mode7_(28) = 1.57;   // R_Armlink
+    q_init_mode7_(29) = 1.0;    // R_Elbow
+    q_init_mode7_(30) = 0.0;    // R_Forearm
+    q_init_mode7_(31) = kMode7RightWrist1Target;  // R_Wrist1
+    q_init_mode7_(32) = 0.0;    // R_Wrist2
+}
+
 CustomController::CustomController(RobotData &rd) 
     :   rd_(rd), //, wbc_(dc.wbc_)
         env(ORT_LOGGING_LEVEL_WARNING, "tocabi"),
@@ -241,6 +296,7 @@ CustomController::CustomController(RobotData &rd)
         session(nullptr),
         arm_session(nullptr)
 {    
+    ROS_INFO("[CC] initialized.");
     ControlVal_.setZero();
 
     const std::string pkg_path = ros::package::getPath("tocabi_cc");
@@ -290,16 +346,28 @@ CustomController::CustomController(RobotData &rd)
         if (cc_cfg["joystick_deadzone"]) joystick_deadzone_ = cc_cfg["joystick_deadzone"].as<double>();
         if (cc_cfg["cmd_vis_scale"]) cmd_vis_scale_ = cc_cfg["cmd_vis_scale"].as<double>();
         if (cc_cfg["q_limit_scale"]) q_limit_scale_ = cc_cfg["q_limit_scale"].as<double>();
-        if (cc_cfg["use_casadi_cam"]) use_casadi_cam_ = cc_cfg["use_casadi_cam"].as<bool>();
-        if (cc_cfg["casadi_cmm_path"]) casadi_cmm_path_ = cc_cfg["casadi_cmm_path"].as<std::string>();
         if (cc_cfg["direct_joystick_enabled"]) direct_joystick_enabled_ = cc_cfg["direct_joystick_enabled"].as<bool>();
         if (cc_cfg["direct_joystick_device"]) direct_joystick_device_ = cc_cfg["direct_joystick_device"].as<std::string>();
+        if (cc_cfg["mode7_init_pose_blend_duration_s"]) mode7_init_pose_blend_duration_s_ = cc_cfg["mode7_init_pose_blend_duration_s"].as<double>();
+        if (cc_cfg["mode7_warmup_steps"]) mode7_warmup_steps_target_ = cc_cfg["mode7_warmup_steps"].as<int>();
     }
 
     if (policy_hz_ <= 0.0)
     {
         ROS_WARN_STREAM("[POLICY] Invalid policy_hz=" << policy_hz_ << ", fallback to 50.0");
         policy_hz_ = 50.0;
+    }
+    if (mode7_init_pose_blend_duration_s_ < 0.0)
+    {
+        ROS_WARN_STREAM("[MODE7] Invalid mode7_init_pose_blend_duration_s="
+                        << mode7_init_pose_blend_duration_s_ << ", fallback to 0.8");
+        mode7_init_pose_blend_duration_s_ = 0.8;
+    }
+    if (mode7_warmup_steps_target_ < 0)
+    {
+        ROS_WARN_STREAM("[MODE7] Invalid mode7_warmup_steps=" << mode7_warmup_steps_target_
+                        << ", fallback to 40");
+        mode7_warmup_steps_target_ = 40;
     }
     if (cmd_ema_window_s_ < 0.0)
     {
@@ -392,7 +460,7 @@ CustomController::CustomController(RobotData &rd)
         if (load_vec("q_init", vec_param) && vec_param.size() == static_cast<size_t>(MODEL_DOF))
         {
             for (int i = 0; i < MODEL_DOF; ++i) q_init_(i) = vec_param[i];
-            q_init_mode7_ = q_init_;
+            applyMode7ArmInitPosePreset();
             pace_hold_q_ = q_init_;
             for (int i = 0; i < num_actuator_action; ++i)
             {
@@ -419,7 +487,6 @@ CustomController::CustomController(RobotData &rd)
         }
     }
     loadJointLimits();
-    loadCasadiCMM();
     {
         std::ofstream clear_file(test_log_dir_ + "/" + test_action_rate_stats_name_,
                                  std::ofstream::out | std::ofstream::trunc);
@@ -428,241 +495,6 @@ CustomController::CustomController(RobotData &rd)
     if (use_arm_policy_)
     {
         loadArmOnnX();
-        // Temporary offline parity check: replay IsaacLab arm obs from CSV and compare ONNX action.
-        auto run_arm_csv_parity_check = [&]() {
-            const std::string csv_path =
-                "/home/user/tocabi_mujoco_ws/src/tocabi_cc/test_log/2026-03-16_13-49-52_model_8000_arm_obs_action.csv";
-            if (!std::filesystem::exists(csv_path))
-            {
-                ROS_WARN_STREAM("[ARM_CSV_CHECK] file not found, skip: " << csv_path);
-                return;
-            }
-            if (arm_input_obs_idx_ < 0 || arm_input_obs_idx_ >= static_cast<int>(arm_input_states_buffer.size()))
-            {
-                ROS_WARN("[ARM_CSV_CHECK] invalid arm_input_obs_idx_, skip.");
-                return;
-            }
-            const size_t obs_dim = arm_input_states_buffer[arm_input_obs_idx_].size();
-            if (obs_dim == 0)
-            {
-                ROS_WARN("[ARM_CSV_CHECK] arm obs dim is zero, skip.");
-                return;
-            }
-
-            std::ifstream in(csv_path);
-            if (!in.is_open())
-            {
-                ROS_WARN_STREAM("[ARM_CSV_CHECK] failed to open: " << csv_path);
-                return;
-            }
-
-            auto split_csv = [](const std::string &line, std::vector<std::string> &tokens) {
-                tokens.clear();
-                std::stringstream ss(line);
-                std::string tok;
-                while (std::getline(ss, tok, ','))
-                {
-                    tokens.push_back(tok);
-                }
-            };
-
-            std::string header_line;
-            if (!std::getline(in, header_line))
-            {
-                ROS_WARN_STREAM("[ARM_CSV_CHECK] empty file: " << csv_path);
-                return;
-            }
-
-            std::vector<std::string> header_tokens;
-            split_csv(header_line, header_tokens);
-            if (header_tokens.empty())
-            {
-                ROS_WARN_STREAM("[ARM_CSV_CHECK] invalid header: " << csv_path);
-                return;
-            }
-
-            std::vector<int> obs_col(obs_dim, -1);
-            std::vector<int> act_col(num_arm_action, -1);
-            for (size_t c = 0; c < header_tokens.size(); ++c)
-            {
-                const std::string &name = header_tokens[c];
-                if (name.rfind("arm_obs_", 0) == 0)
-                {
-                    try
-                    {
-                        const int idx = std::stoi(name.substr(8));
-                        if (idx >= 0 && idx < static_cast<int>(obs_dim) && obs_col[idx] < 0)
-                        {
-                            obs_col[idx] = static_cast<int>(c);
-                        }
-                    }
-                    catch (...) {}
-                }
-                else if (name.rfind("arm_act_", 0) == 0)
-                {
-                    try
-                    {
-                        const int idx = std::stoi(name.substr(8));
-                        if (idx >= 0 && idx < num_arm_action && act_col[idx] < 0)
-                        {
-                            act_col[idx] = static_cast<int>(c);
-                        }
-                    }
-                    catch (...) {}
-                }
-            }
-
-            for (size_t i = 0; i < obs_dim; ++i)
-            {
-                if (obs_col[i] < 0)
-                {
-                    ROS_WARN_STREAM("[ARM_CSV_CHECK] missing arm_obs_" << i << " column, skip.");
-                    return;
-                }
-            }
-            for (int i = 0; i < num_arm_action; ++i)
-            {
-                if (act_col[i] < 0)
-                {
-                    ROS_WARN_STREAM("[ARM_CSV_CHECK] missing arm_act_" << i << " column, skip.");
-                    return;
-                }
-            }
-
-            size_t parse_fail_rows = 0;
-            std::vector<std::string> row_tokens;
-            std::vector<float> obs_first(obs_dim, 0.0f);
-            std::array<double, num_arm_action> gt_row1{};
-            std::array<double, num_arm_action> gt_row2{};
-            bool got_row1 = false;
-            bool got_row2 = false;
-            size_t row_idx = 0;
-
-            std::string line;
-            while (std::getline(in, line))
-            {
-                if (line.empty()) continue;
-                split_csv(line, row_tokens);
-                ++row_idx;
-
-                bool row_ok = !row_tokens.empty();
-                if (row_ok)
-                {
-                    for (size_t i = 0; i < obs_dim; ++i)
-                    {
-                        const int c = obs_col[i];
-                        if (c < 0 || c >= static_cast<int>(row_tokens.size()))
-                        {
-                            row_ok = false;
-                            break;
-                        }
-                        try
-                        {
-                            if (!got_row1) obs_first[i] = std::stof(row_tokens[c]);
-                        }
-                        catch (...)
-                        {
-                            row_ok = false;
-                            break;
-                        }
-                    }
-                }
-                if (!row_ok)
-                {
-                    ++parse_fail_rows;
-                    continue;
-                }
-
-                auto read_gt = [&](std::array<double, num_arm_action> &dst) {
-                    for (int j = 0; j < num_arm_action; ++j)
-                    {
-                        double v = 0.0;
-                        const int c = act_col[j];
-                        if (c >= 0 && c < static_cast<int>(row_tokens.size()))
-                        {
-                            try { v = std::stod(row_tokens[c]); } catch (...) { v = 0.0; }
-                        }
-                        dst[j] = v;
-                    }
-                };
-
-                if (!got_row1)
-                {
-                    read_gt(gt_row1);
-                    got_row1 = true;
-                    continue;
-                }
-                read_gt(gt_row2);
-                got_row2 = true;
-                break;
-            }
-
-            if (!got_row1)
-            {
-                ROS_WARN_STREAM("[ARM_CSV_CHECK] no valid row found. parse_fail_rows=" << parse_fail_rows);
-                return;
-            }
-
-            std::copy(obs_first.begin(), obs_first.end(), arm_input_states_buffer[arm_input_obs_idx_].begin());
-            auto out = arm_session.Run(Ort::RunOptions{nullptr},
-                                       arm_input_names_char.data(),
-                                       arm_input_tensors.data(),
-                                       arm_input_number,
-                                       arm_output_names_char.data(),
-                                       arm_output_number);
-            if (out.empty() || !out[0].IsTensor())
-            {
-                ROS_WARN("[ARM_CSV_CHECK] arm_session output invalid.");
-                return;
-            }
-            const float *pred_raw = out[0].GetTensorMutableData<float>();
-
-            std::array<double, num_arm_action> pred_vec{};
-            std::array<double, num_arm_action> err_same{};
-            std::array<double, num_arm_action> err_shift{};
-            double mae_same = 0.0;
-            double mae_shift = 0.0;
-            for (int j = 0; j < num_arm_action; ++j)
-            {
-                pred_vec[j] = static_cast<double>(pred_raw[j]);
-                err_same[j] = std::abs(pred_vec[j] - gt_row1[j]);
-                mae_same += err_same[j];
-                if (got_row2)
-                {
-                    err_shift[j] = std::abs(pred_vec[j] - gt_row2[j]);
-                    mae_shift += err_shift[j];
-                }
-            }
-            mae_same /= static_cast<double>(num_arm_action);
-            if (got_row2) mae_shift /= static_cast<double>(num_arm_action);
-
-            auto arr_to_str = [&](const auto &arr) {
-                std::ostringstream ss;
-                ss << std::fixed << std::setprecision(6) << "[";
-                for (size_t i = 0; i < arr.size(); ++i)
-                {
-                    if (i > 0) ss << ", ";
-                    ss << arr[i];
-                }
-                ss << "]";
-                return ss.str();
-            };
-
-            ROS_INFO_STREAM("[ARM_CSV_CHECK_FIRST] joint_order=[L_Sh1,L_Sh2,L_Sh3,L_Elb,R_Sh1,R_Sh2,R_Sh3,R_Elb]"
-                            << " pred_raw=" << arr_to_str(pred_vec)
-                            << " gt_row1=" << arr_to_str(gt_row1)
-                            << " abs_err_row1=" << arr_to_str(err_same)
-                            << " mae_row1=" << mae_same);
-            if (got_row2)
-            {
-                ROS_INFO_STREAM("[ARM_CSV_CHECK_SHIFT] joint_order=[L_Sh1,L_Sh2,L_Sh3,L_Elb,R_Sh1,R_Sh2,R_Sh3,R_Elb]"
-                                << " gt_row2=" << arr_to_str(gt_row2)
-                                << " abs_err_row2=" << arr_to_str(err_shift)
-                                << " mae_row2=" << mae_shift
-                                << " (play_modular dump offset test)");
-            }
-        };
-        run_arm_csv_parity_check();
     }
 
     if (!direct_joystick_enabled_)
@@ -743,7 +575,10 @@ void CustomController::initVariable()
                 0.3, 0.3, 1.5, -1.27, -1.0, 0.0, -1.0, 0.0,
                 0.0, 0.0,
                 -0.3, -0.3, -1.5, 1.27, 1.0, 0.0, 1.0, 0.0;
-    q_init_mode7_ = q_init_;
+    applyMode7ArmInitPosePreset();
+    mode7_init_pose_blend_active_ = false;
+    mode7_init_pose_blend_start_us_ = 0.0;
+    mode7_init_pose_blend_q0_ = q_init_;
 
     pace_direction_ << 1.0, 1.0, 1.0, 1.0,
                        1.0, 1.0, 1.0, 1.0,
@@ -835,47 +670,6 @@ void CustomController::loadJointLimits()
 
     has_joint_limits_ = true;
 }
-
-void CustomController::loadCasadiCMM()
-{
-    if (!use_casadi_cam_)
-    {
-        return;
-    }
-
-// #ifdef TOCABI_CC_USE_CASADI
-//     if (casadi_cmm_path_.empty())
-//     {
-//         ROS_WARN("use_casadi_cam is true but casadi_cmm_path is empty. Disabling CasADi CAM.");
-//         use_casadi_cam_ = false;
-//         return;
-//     }
-//     if (!std::filesystem::exists(casadi_cmm_path_))
-//     {
-//         ROS_WARN_STREAM("CasADi CMM file not found: " << casadi_cmm_path_
-//                                                       << ". Disabling CasADi CAM.");
-//         use_casadi_cam_ = false;
-//         return;
-//     }
-//     try
-//     {
-//         cmm_fn_ = casadi::Function::load(casadi_cmm_path_);
-//         casadi_cam_ready_ = true;
-//         ROS_INFO_STREAM("Loaded CasADi CMM function: " << casadi_cmm_path_);
-//     }
-//     catch (const std::exception &e)
-//     {
-//         ROS_WARN_STREAM("Failed to load CasADi CMM (" << casadi_cmm_path_ << "): " << e.what()
-//                                                       << ". Disabling CasADi CAM.");
-//         use_casadi_cam_ = false;
-//         casadi_cam_ready_ = false;
-//     }
-// #else
-//     ROS_WARN("Built without CasADi support. Disabling CasADi CAM.");
-//     use_casadi_cam_ = false;
-// #endif
-}
-
 
 void CustomController::loadOnnX()
 {
@@ -1415,10 +1209,8 @@ void CustomController::processObservation()
         cm_bf_full_.setZero();
         cm_des_world_full_.setZero();
         cm_des_bf_full_.setZero();
-        if (rd_cc_.CMM.rows() >= 6 && rd_cc_.CMM.cols() >= MODEL_DOF_VIRTUAL &&
-            rd_cc_.q_dot_virtual_.size() >= MODEL_DOF_VIRTUAL)
+        if (rd_cc_.q_dot_virtual_.size() >= MODEL_DOF_VIRTUAL)
         {
-            const Eigen::Matrix<double, 6, Eigen::Dynamic> cmm = rd_cc_.CMM.topRows<6>();
             const Eigen::VectorXd v = rd_cc_.q_dot_virtual_.segment(0, MODEL_DOF_VIRTUAL);
             Eigen::VectorXd v_des = Eigen::VectorXd::Zero(MODEL_DOF_VIRTUAL);
             // Match training-side gen_vel_body_pin_des construction:
@@ -1427,25 +1219,36 @@ void CustomController::processObservation()
             v_des(1) = target_vel_raw_y_;
             v_des(5) = target_vel_raw_yaw_;
 
-            const Eigen::Vector6d cm = cmm * v;
-            const Eigen::Vector6d cm_des = cmm * v_des;
+            Eigen::Matrix<double, 6, Eigen::Dynamic> cmm;
+            bool cmm_ready = false;
+            if (!cmm_ready && rd_cc_.CMM.rows() >= 6 && rd_cc_.CMM.cols() >= MODEL_DOF_VIRTUAL)
+            {
+                cmm = rd_cc_.CMM.topRows<6>();
+                cmm_ready = true;
+            }
 
-            // Convert CM / CM_des to body frame.
-            const Eigen::Matrix3d Rbw = q.toRotationMatrix().transpose();
-            Eigen::Vector6d cm_bf;
-            Eigen::Vector6d cm_des_bf;
-            cm_bf.head<3>() = Rbw * cm.head<3>();
-            cm_bf.tail<3>() = Rbw * cm.tail<3>();
-            cm_des_bf.head<3>() = Rbw * cm_des.head<3>();
-            cm_des_bf.tail<3>() = Rbw * cm_des.tail<3>();
-            cm_world_full_ = cm;
-            cm_bf_full_ = cm_bf;
-            cm_des_world_full_ = cm_des;
-            cm_des_bf_full_ = cm_des_bf;
-            // Match IsaacLab mixed convention:
-            //   x,y = angular momentum in body frame, z = angular momentum in world frame.
-            cam_bf_ << cm_bf(3), cm_bf(4), cm(5);
-            cam_des_bf_ << cm_des_bf(3), cm_des_bf(4), cm_des(5);
+            if (cmm_ready)
+            {
+                const Eigen::Vector6d cm = cmm * v;
+                const Eigen::Vector6d cm_des = cmm * v_des;
+
+                // Convert CM / CM_des to body frame.
+                const Eigen::Matrix3d Rbw = q.toRotationMatrix().transpose();
+                Eigen::Vector6d cm_bf;
+                Eigen::Vector6d cm_des_bf;
+                cm_bf.head<3>() = Rbw * cm.head<3>();
+                cm_bf.tail<3>() = Rbw * cm.tail<3>();
+                cm_des_bf.head<3>() = Rbw * cm_des.head<3>();
+                cm_des_bf.tail<3>() = Rbw * cm_des.tail<3>();
+                cm_world_full_ = cm;
+                cm_bf_full_ = cm_bf;
+                cm_des_world_full_ = cm_des;
+                cm_des_bf_full_ = cm_des_bf;
+                // Match IsaacLab mixed convention:
+                //   x,y = angular momentum in body frame, z = angular momentum in world frame.
+                cam_bf_ << cm_bf(3), cm_bf(4), cm(5);
+                cam_des_bf_ << cm_des_bf(3), cm_des_bf(4), cm_des(5);
+            }
         }
     }
 
@@ -1692,11 +1495,12 @@ void CustomController::processArmObservation()
     int data_idx = 0;
     std::array<float, 3> arm_base_ang_cur = {0.0f, 0.0f, 0.0f};
     std::array<float, 3> arm_gravity_cur = {0.0f, 0.0f, 0.0f};
-    std::array<float, num_arm_action> arm_joint_pos_cur{};
-    std::array<float, num_arm_action> arm_joint_vel_cur{};
+    std::array<float, 3> arm_cmd_cur = {0.0f, 0.0f, 0.0f};
+    std::array<float, num_actuator_action> arm_leg_joint_pos_cur{};
+    std::array<float, num_actuator_action> arm_leg_joint_vel_cur{};
+    std::array<float, num_arm_obs_joint> arm_joint_pos_cur{};
+    std::array<float, num_arm_obs_joint> arm_joint_vel_cur{};
     std::array<float, num_arm_action> arm_last_action_cur{};
-    std::array<float, 3> arm_cam_cur = {0.0f, 0.0f, 0.0f};
-    std::array<float, 3> arm_cam_des_cur = {0.0f, 0.0f, 0.0f};
 
     Eigen::Quaterniond q;
     q.x() = rd_cc_.q_virtual_(3);
@@ -1731,8 +1535,31 @@ void CustomController::processArmObservation()
     arm_gravity_cur[1] = static_cast<float>(gravity_bf(1));
     arm_gravity_cur[2] = static_cast<float>(gravity_bf(2));
 
+    // velocity_commands (world frame), same source used by leg observation.
+    arm_state_cur_[data_idx++] = static_cast<float>(target_vel_x_);
+    arm_state_cur_[data_idx++] = static_cast<float>(target_vel_y_);
+    arm_state_cur_[data_idx++] = static_cast<float>(target_vel_yaw_);
+    arm_cmd_cur[0] = static_cast<float>(target_vel_x_);
+    arm_cmd_cur[1] = static_cast<float>(target_vel_y_);
+    arm_cmd_cur[2] = static_cast<float>(target_vel_yaw_);
+
+    // joint_pos (legs)
+    for (int i = 0; i < num_actuator_action; i++)
+    {
+        arm_state_cur_[data_idx++] = q_noise_(kLegJointMapObs[i]);
+        arm_leg_joint_pos_cur[i] = static_cast<float>(q_noise_(kLegJointMapObs[i]));
+    }
+
+    // joint_vel (legs)
+    const auto &arm_leg_joint_vel_src = use_obs_joint_vel_lpf_ ? q_dot_lpf_ : q_vel_noise_;
+    for (int i = 0; i < num_actuator_action; i++)
+    {
+        arm_state_cur_[data_idx++] = arm_leg_joint_vel_src(kLegJointMapObs[i]);
+        arm_leg_joint_vel_cur[i] = static_cast<float>(arm_leg_joint_vel_src(kLegJointMapObs[i]));
+    }
+
     // joint_pos (arms)
-    for (int i = 0; i < num_arm_action; i++)
+    for (int i = 0; i < num_arm_obs_joint; i++)
     {
         arm_state_cur_[data_idx++] = q_noise_(kArmJointMapObs[i]);
         arm_joint_pos_cur[i] = static_cast<float>(q_noise_(kArmJointMapObs[i]));
@@ -1740,7 +1567,7 @@ void CustomController::processArmObservation()
 
     // joint_vel (arms)
     const auto &arm_joint_vel_src = use_obs_joint_vel_lpf_ ? q_dot_lpf_ : q_vel_noise_;
-    for (int i = 0; i < num_arm_action; i++)
+    for (int i = 0; i < num_arm_obs_joint; i++)
     {
         arm_state_cur_[data_idx++] = arm_joint_vel_src(kArmJointMapObs[i]);
         arm_joint_vel_cur[i] = static_cast<float>(arm_joint_vel_src(kArmJointMapObs[i]));
@@ -1754,33 +1581,20 @@ void CustomController::processArmObservation()
         arm_last_action_cur[i] = a;
     }
 
-    // CAM + CAM_des (body frame)
-    arm_state_cur_[data_idx++] = cam_bf_(0);
-    arm_state_cur_[data_idx++] = cam_bf_(1);
-    arm_state_cur_[data_idx++] = cam_bf_(2);
-    arm_state_cur_[data_idx++] = cam_des_bf_(0);
-    arm_state_cur_[data_idx++] = cam_des_bf_(1);
-    arm_state_cur_[data_idx++] = cam_des_bf_(2);
-    arm_cam_cur[0] = static_cast<float>(cam_bf_(0));
-    arm_cam_cur[1] = static_cast<float>(cam_bf_(1));
-    arm_cam_cur[2] = static_cast<float>(cam_bf_(2));
-    arm_cam_des_cur[0] = static_cast<float>(cam_des_bf_(0));
-    arm_cam_des_cur[1] = static_cast<float>(cam_des_bf_(1));
-    arm_cam_des_cur[2] = static_cast<float>(cam_des_bf_(2));
-
     for (int i = data_idx; i < num_arm_state; ++i)
     {
         arm_state_cur_[i] = 0.0f;
     }
 
-    // History layout for arm actor follows IsaacLab:
-    // [core_hist (no last_action), current last_action]
-    // core = base_ang_vel(3)+gravity(3)+joint_pos(8)+joint_vel(8)+CAM(3)+CAM_des(3) = 28
+    // History layout for arm actor:
+    // [core_hist, current velocity_commands, current last_arm_action]
+    // core = 3(base_ang_vel)+3(gravity)+12(leg_q)+12(leg_qd)+8(arm_q)+8(arm_qd) = 46
+    // current-only = 3(velocity_commands)+2(last_arm_action) = 5
     if (use_obs_history_layout_ && arm_input_obs_idx_ >= 0 &&
         arm_input_obs_idx_ < static_cast<int>(arm_input_states_buffer.size()))
     {
-        constexpr size_t kArmCoreDim = static_cast<size_t>(num_arm_internal_state); // 28
-        constexpr size_t kArmCurrOnlyDim = static_cast<size_t>(num_arm_action);      // 8
+        constexpr size_t kArmCoreDim = static_cast<size_t>(num_arm_internal_state); // 46
+        constexpr size_t kArmCurrOnlyDim = 3 + static_cast<size_t>(num_arm_action); // 5
         const size_t obs_size = arm_input_states_buffer[arm_input_obs_idx_].size();
         if (obs_size >= kArmCurrOnlyDim)
         {
@@ -1791,10 +1605,10 @@ void CustomController::processArmObservation()
                 std::vector<float> cur_core(kArmCoreDim, 0.0f);
                 for (size_t i = 0; i < 3; ++i) cur_core[i] = arm_base_ang_cur[i];
                 for (size_t i = 0; i < 3; ++i) cur_core[3 + i] = arm_gravity_cur[i];
-                for (size_t i = 0; i < num_arm_action; ++i) cur_core[6 + i] = arm_joint_pos_cur[i];
-                for (size_t i = 0; i < num_arm_action; ++i) cur_core[14 + i] = arm_joint_vel_cur[i];
-                for (size_t i = 0; i < 3; ++i) cur_core[22 + i] = arm_cam_cur[i];
-                for (size_t i = 0; i < 3; ++i) cur_core[25 + i] = arm_cam_des_cur[i];
+                for (size_t i = 0; i < num_actuator_action; ++i) cur_core[6 + i] = arm_leg_joint_pos_cur[i];
+                for (size_t i = 0; i < num_actuator_action; ++i) cur_core[18 + i] = arm_leg_joint_vel_cur[i];
+                for (size_t i = 0; i < num_arm_obs_joint; ++i) cur_core[30 + i] = arm_joint_pos_cur[i];
+                for (size_t i = 0; i < num_arm_obs_joint; ++i) cur_core[38 + i] = arm_joint_vel_cur[i];
 
                 arm_hist_core_queue_.push_back(cur_core);
                 while (arm_hist_core_queue_.size() > hist_len)
@@ -1829,38 +1643,40 @@ void CustomController::processArmObservation()
                     const auto &hist = get_hist_core(k);
                     for (size_t j = 0; j < 3; ++j) dst[out++] = hist[3 + j];
                 }
-                // 3) arm joint_pos history (oldest -> newest)
+                // 3) velocity_commands current
+                for (size_t j = 0; j < 3; ++j) dst[out++] = arm_cmd_cur[j];
+                // 4) leg joint_pos history (oldest -> newest)
                 for (size_t h = 0; h < hist_len; ++h)
                 {
                     const size_t k = hist_len - 1 - h;
                     const auto &hist = get_hist_core(k);
-                    for (size_t j = 0; j < num_arm_action; ++j) dst[out++] = hist[6 + j];
+                    for (size_t j = 0; j < num_actuator_action; ++j) dst[out++] = hist[6 + j];
                 }
-                // 4) arm joint_vel history (oldest -> newest)
+                // 5) leg joint_vel history (oldest -> newest)
                 for (size_t h = 0; h < hist_len; ++h)
                 {
                     const size_t k = hist_len - 1 - h;
                     const auto &hist = get_hist_core(k);
-                    for (size_t j = 0; j < num_arm_action; ++j) dst[out++] = hist[14 + j];
+                    for (size_t j = 0; j < num_actuator_action; ++j) dst[out++] = hist[18 + j];
                 }
-                // 5) current last_arm_action only (task cfg keeps this one-step, no history)
-                for (size_t j = 0; j < kArmCurrOnlyDim; ++j)
+                // 6) arm joint_pos history (oldest -> newest)
+                for (size_t h = 0; h < hist_len; ++h)
+                {
+                    const size_t k = hist_len - 1 - h;
+                    const auto &hist = get_hist_core(k);
+                    for (size_t j = 0; j < num_arm_obs_joint; ++j) dst[out++] = hist[30 + j];
+                }
+                // 7) arm joint_vel history (oldest -> newest)
+                for (size_t h = 0; h < hist_len; ++h)
+                {
+                    const size_t k = hist_len - 1 - h;
+                    const auto &hist = get_hist_core(k);
+                    for (size_t j = 0; j < num_arm_obs_joint; ++j) dst[out++] = hist[38 + j];
+                }
+                // 8) current last_arm_action only (no history)
+                for (size_t j = 0; j < static_cast<size_t>(num_arm_action); ++j)
                 {
                     dst[out++] = arm_last_action_cur[j];
-                }
-                // 6) CAM history (oldest -> newest)
-                for (size_t h = 0; h < hist_len; ++h)
-                {
-                    const size_t k = hist_len - 1 - h;
-                    const auto &hist = get_hist_core(k);
-                    for (size_t j = 0; j < 3; ++j) dst[out++] = hist[22 + j];
-                }
-                // 7) CAM_des history (oldest -> newest)
-                for (size_t h = 0; h < hist_len; ++h)
-                {
-                    const size_t k = hist_len - 1 - h;
-                    const auto &hist = get_hist_core(k);
-                    for (size_t j = 0; j < 3; ++j) dst[out++] = hist[25 + j];
                 }
                 return;
             }
@@ -2064,14 +1880,18 @@ void CustomController::feedforwardArmPolicy()
         ROS_ERROR("Arm ONNX action output has %zu elements; expected at least %d.", action_count, num_arm_action);
         return;
     }
+    if (action_count != num_arm_action)
+    {
+        ROS_WARN_STREAM_THROTTLE(1.0, "[ARM_ONNX] action output dim=" << action_count
+                                  << " but controller expects " << num_arm_action
+                                  << ". Using first " << num_arm_action << " elements.");
+    }
+    Eigen::Matrix<double, num_arm_action, 1> raw_action_arm;
     for (size_t i = 0; i < num_arm_action; i++)
     {
-        rl_action_arm_(i) = DyrosMath::minmax_cut(action_data[i], -1.0, 1.0);
+        raw_action_arm(i) = action_data[i];
     }
-    // Match training action config: keep shoulder1 joints fixed at zero.
-    // arm index 0: L_Shoulder1, arm index 4: R_Shoulder1
-    rl_action_arm_(0) = 0.0;
-    rl_action_arm_(4) = 0.0;
+    applyIsaacLabArmActionPostprocess(raw_action_arm, rl_action_arm_);
 }
 
 void CustomController::computeSlow()
@@ -2418,7 +2238,9 @@ void CustomController::computeSlow()
                 for (int i = num_actuator_action; i < MODEL_DOF; i++)
                 {
                     const double hold_target =
-                        (use_arm_policy_ && (i == kLeftWrist1Joint || i == kRightWrist1Joint)) ? 0.0 : q_init_mode7_(i);
+                        (i == kLeftWrist1Joint) ? kMode7LeftWrist1Target :
+                        (i == kRightWrist1Joint) ? kMode7RightWrist1Target :
+                                                   q_init_mode7_(i);
                     torque_rl_(i) = kp_(i, i) * (hold_target - q_noise_(i)) -
                                     kv_(i, i) * (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(i) : q_vel_noise_(i));
                 }
@@ -2583,8 +2405,8 @@ void CustomController::computeSlow()
             {
                 return 0;
             }
-            constexpr size_t kArmCoreDim = static_cast<size_t>(num_arm_internal_state); // 28
-            constexpr size_t kArmCurrOnlyDim = static_cast<size_t>(num_arm_action);      // 8
+            constexpr size_t kArmCoreDim = static_cast<size_t>(num_arm_internal_state); // 46
+            constexpr size_t kArmCurrOnlyDim = 3 + static_cast<size_t>(num_arm_action); // 5
             const size_t obs_size = arm_input_states_buffer[arm_input_obs_idx_].size();
             if (obs_size < kArmCurrOnlyDim)
             {
@@ -2595,11 +2417,11 @@ void CustomController::computeSlow()
             {
                 return 0;
             }
-            if (hist_residual % kArmCoreDim != 0)
+            if ((hist_residual % kArmCoreDim) == 0)
             {
-                return 0;
+                return hist_residual / kArmCoreDim;
             }
-            return hist_residual / kArmCoreDim;
+            return 0;
         };
         auto write_arm_obs_action_row = [&]() {
             if (!use_arm_policy_ || !test_arm_obs_action_file_.is_open())
@@ -2750,6 +2572,7 @@ void CustomController::computeSlow()
             action_rate_timeavg_last_print_us_ = 0;
             leg_hist_core_queue_.clear();
             arm_hist_core_queue_.clear();
+            mode7_init_pose_blend_active_ = false;
             sim_paused_ = false;
             if (test_act_file_.is_open())
             {
@@ -2773,14 +2596,10 @@ void CustomController::computeSlow()
             {
                 test_arm_obs_action_file_.close();
             }
-            test_arm_obs_action_file_.open(test_log_dir_ + "/" + test_arm_obs_action_name_,
-                                           std::ofstream::out | std::ofstream::trunc);
             if (test_cam_compare_file_.is_open())
             {
                 test_cam_compare_file_.close();
             }
-            test_cam_compare_file_.open(test_log_dir_ + "/" + test_cam_compare_name_,
-                                        std::ofstream::out | std::ofstream::trunc);
             if (!test_act_file_)
             {
                 ROS_WARN_STREAM("[TEST_LOG] Failed to open " << test_act_runtime_name_ << " in " << test_log_dir_);
@@ -2848,7 +2667,10 @@ void CustomController::computeSlow()
             cmd_zero_lock_ = false;
             cmd_stop_min_phase_cycles_ = 0.0;
             last_sim_time_observed_s_ = -1.0;
+            last_control_time_observed_us_ = -1;
             sim_time_prev_s_ = sim_time_s_;
+            applyMode7ArmInitPosePreset();
+            mode7_warmup_steps_remaining_ = mode7_warmup_steps_target_;
             // Treat mode-7 entry as a one-shot "send" so phase starts even with GUI-only control.
             mode7_send_triggered_ = true;
             {
@@ -2871,6 +2693,18 @@ void CustomController::computeSlow()
 
         if (rd_cc_.tc_init || !mode7_active_)
         {
+            // Re-entering mode7 (including sim/task reset): always rebuild history from scratch.
+            leg_hist_core_queue_.clear();
+            arm_hist_core_queue_.clear();
+            rl_action_.setZero();
+            rl_action_pre_.setZero();
+            rl_action_arm_.setZero();
+            rl_action_arm_pre_.setZero();
+            mode7_send_triggered_ = true;
+            mode7_init_pose_blend_active_ = false;
+            mode7_warmup_steps_remaining_ = mode7_warmup_steps_target_;
+            last_control_time_observed_us_ = -1;
+
             // Initialize settings for Task Control.
             start_time_ = rd_cc_.control_time_us_;
             q_noise_pre_ = q_noise_ = rd_cc_.q_virtual_.segment(6, MODEL_DOF);
@@ -2985,7 +2819,7 @@ void CustomController::computeSlow()
                     << " cam=(" << cam_bf_(0) << "," << cam_bf_(1) << "," << cam_bf_(2) << ")"
                     << " cam_des=(" << cam_des_bf_(0) << "," << cam_des_bf_(1) << "," << cam_des_bf_(2) << ")");
             }
-            if (hist_ready)
+            if (hist_ready && mode7_warmup_steps_remaining_ <= 0)
             {
                 const auto policy_t0 = std::chrono::steady_clock::now();
                 feedforwardPolicy();
@@ -3036,38 +2870,134 @@ void CustomController::computeSlow()
         }
 
         mode7_active_ = true;
+        bool sim_time_reset_detected = false;
         if (sim_time_received_)
         {
             if (last_sim_time_observed_s_ >= 0.0 && sim_time_s_ + 1.0e-6 < last_sim_time_observed_s_)
             {
-                // Sim reset detected (time jump backwards): restart like initial mode7 warm-up.
-                leg_hist_core_queue_.clear();
-                arm_hist_core_queue_.clear();
-                rl_action_.setZero();
-                rl_action_pre_.setZero();
-                rl_action_arm_.setZero();
-                rl_action_arm_pre_.setZero();
-                mode7_send_triggered_ = true;
-                time_inference_pre_ = rd_cc_.control_time_us_;
-                ROS_INFO("[MODE7] Sim reset detected. Rebuilding observation history before policy.");
+                sim_time_reset_detected = true;
             }
             last_sim_time_observed_s_ = sim_time_s_;
         }
-        if (mode7_send_triggered_)
+        const bool control_time_reset_detected =
+            (last_control_time_observed_us_ >= 0 &&
+             (rd_cc_.control_time_us_ + 1.0e-6 < static_cast<double>(last_control_time_observed_us_)));
+        last_control_time_observed_us_ = rd_cc_.control_time_us_;
+        if (sim_time_reset_detected || control_time_reset_detected)
         {
-            // Reset phase and last action on send so the next obs reflects the reset.
+            // Sim/task reset detected: restart like initial mode7 warm-up.
+            leg_hist_core_queue_.clear();
+            arm_hist_core_queue_.clear();
+            std::fill(state_buffer_.begin(), state_buffer_.end(), 0.0f);
+            std::fill(arm_state_buffer_.begin(), arm_state_buffer_.end(), 0.0f);
+            for (auto &buf : input_states_buffer)
+            {
+                std::fill(buf.begin(), buf.end(), 0.0f);
+            }
+            for (auto &buf : arm_input_states_buffer)
+            {
+                std::fill(buf.begin(), buf.end(), 0.0f);
+            }
+            if (is_hist_encoder_)
+            {
+                std::fill(state_long_hist_.begin(), state_long_hist_.end(), 0.0f);
+            }
             rl_action_.setZero();
             rl_action_pre_.setZero();
             rl_action_arm_.setZero();
             rl_action_arm_pre_.setZero();
+            mode7_send_triggered_ = true;
+            mode7_init_pose_blend_active_ = false;
+            mode7_warmup_steps_remaining_ = mode7_warmup_steps_target_;
+            time_inference_pre_ = rd_cc_.control_time_us_;
+            // Mirror stop->restart command handling: clear accumulated keyboard cmd,
+            // hold zero briefly, and ignore stale buffered cmd until it changes.
+            cmd_zero_lock_ = false;
+            cmd_resume_zero_hold_ticks_ = 25; // ~0.1s at 250 Hz
+            stale_keyboard_cmd_x_ = target_vel_raw_x_;
+            stale_keyboard_cmd_y_ = target_vel_raw_y_;
+            stale_keyboard_cmd_yaw_ = target_vel_raw_yaw_;
+            ignore_stale_keyboard_cmd_ = true;
+            target_vel_raw_x_ = 0.0;
+            target_vel_raw_y_ = 0.0;
+            target_vel_raw_yaw_ = 0.0;
+            target_vel_x_ = 0.0;
+            target_vel_y_ = 0.0;
+            target_vel_yaw_ = 0.0;
+            cmd_ema_initialized_ = true;
+            cmd_ema_last_us_ = rd_cc_.control_time_us_;
+            std_msgs::String reset_cmd_msg;
+            reset_cmd_msg.data = "keyboard_cmd_reset";
+            sim_command_pub_.publish(reset_cmd_msg);
+            std_msgs::String kb_unlock_msg;
+            kb_unlock_msg.data = "keyboard_cmd_unlock";
+            sim_command_pub_.publish(kb_unlock_msg);
+            ROS_INFO_STREAM("[MODE7] Reset detected (sim_time=" << (sim_time_reset_detected ? 1 : 0)
+                            << ", control_time=" << (control_time_reset_detected ? 1 : 0)
+                            << "). Rebuilding observation history before policy (with stop->restart cmd reset).");
+        }
+        if (mode7_send_triggered_)
+        {
+            // Re-arm smooth restart profile on every explicit mode7 send/reset.
+            // Without this, start_time_/torque_init_ may stay stale and skip the 0.1s torque cubic.
+            start_time_ = rd_cc_.control_time_us_;
+            torque_init_ = rd_cc_.torque_desired;
+            torque_rl_ = torque_init_;
+            torque_spline_ = torque_init_;
+            if (rd_cc_.q_virtual_.size() >= (6 + MODEL_DOF))
+            {
+                q_noise_pre_ = q_noise_ = rd_cc_.q_virtual_.segment(6, MODEL_DOF);
+            }
+            time_cur_ = start_time_ / 1e6;
+            time_pre_ = time_cur_ - 0.005;
+            time_inference_pre_ = rd_cc_.control_time_us_;
+
+            // Reset phase and last action on send so the next obs reflects the reset.
+            applyMode7ArmInitPosePreset();
+            rl_action_.setZero();
+            rl_action_pre_.setZero();
+            rl_action_arm_.setZero();
+            rl_action_arm_pre_.setZero();
+            leg_hist_core_queue_.clear();
+            arm_hist_core_queue_.clear();
+            for (auto &buf : input_states_buffer)
+            {
+                std::fill(buf.begin(), buf.end(), 0.0f);
+            }
+            for (auto &buf : arm_input_states_buffer)
+            {
+                std::fill(buf.begin(), buf.end(), 0.0f);
+            }
+            mode7_warmup_steps_remaining_ = mode7_warmup_steps_target_;
+            ROS_INFO_STREAM("[MODE7] Warmup reset: steps=" << mode7_warmup_steps_remaining_
+                            << " arm_policy=" << (use_arm_policy_ ? 1 : 0)
+                            << " q_init_mode7_sh2=(" << q_init_mode7_(16) << "," << q_init_mode7_(26) << ")");
+            if (use_arm_policy_)
+            {
+                mode7_init_pose_blend_active_ = false;
+                g_mode7_blend_reseed_pending = true;
+            }
+            else
+            {
+                mode7_init_pose_blend_active_ = false;
+                g_mode7_blend_reseed_pending = false;
+            }
             phase_started_ = true;
             phase_start_time_s_ = rd_cc_.control_time_us_ / 1.0e6;
             phase_time_s_ = 0.0;
             phase_last_update_us_ = rd_cc_.control_time_us_;
             sim_time_prev_s_ = sim_time_s_;
+            last_control_time_observed_us_ = rd_cc_.control_time_us_;
             mode7_send_triggered_ = false;
         }
         processNoise();
+        if (use_arm_policy_ && g_mode7_blend_reseed_pending)
+        {
+            mode7_init_pose_blend_active_ = true;
+            mode7_init_pose_blend_start_us_ = static_cast<double>(rd_cc_.control_time_us_);
+            mode7_init_pose_blend_q0_ = q_noise_;
+            g_mode7_blend_reseed_pending = false;
+        }
         bool mode7_policy_ran_this_tick = false;
 
         if ((rd_cc_.control_time_us_ - time_inference_pre_) / 1.0e6 >= 1.0 / policy_hz_)
@@ -3104,6 +3034,7 @@ void CustomController::computeSlow()
             }
             const size_t required_arm_hist_len = get_required_arm_hist_len();
             const bool arm_hist_ready = (required_arm_hist_len == 0) || (arm_hist_core_queue_.size() >= required_arm_hist_len);
+            const bool warmup_done = (mode7_warmup_steps_remaining_ <= 0);
             if (use_arm_policy_)
             {
                 const size_t arm_obs_size =
@@ -3118,7 +3049,7 @@ void CustomController::computeSlow()
                     << " cam=(" << cam_bf_(0) << "," << cam_bf_(1) << "," << cam_bf_(2) << ")"
                     << " cam_des=(" << cam_des_bf_(0) << "," << cam_des_bf_(1) << "," << cam_des_bf_(2) << ")");
             }
-            if (hist_ready)
+            if (hist_ready && warmup_done)
             {
                 const auto policy_t0 = std::chrono::steady_clock::now();
                 feedforwardPolicy();
@@ -3151,6 +3082,10 @@ void CustomController::computeSlow()
             {
                 rl_action_.setZero();
                 rl_action_arm_.setZero();
+            }
+            if (mode7_warmup_steps_remaining_ > 0)
+            {
+                mode7_warmup_steps_remaining_--;
             }
             static int dbg_tick2 = 0;
             // if ((dbg_tick2++ % 20) == 0)
@@ -3296,15 +3231,38 @@ void CustomController::computeSlow()
         }
 
         const size_t required_hist_len = get_required_leg_hist_len();
-        const bool hist_ready_for_control = (required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len);
+        const bool hist_ready_for_control =
+            ((required_hist_len == 0) || (leg_hist_core_queue_.size() >= required_hist_len));
         const size_t required_arm_hist_len_for_control = get_required_arm_hist_len();
         const bool arm_hist_ready_for_control =
-            (!use_arm_policy_) || (required_arm_hist_len_for_control == 0) || (arm_hist_core_queue_.size() >= required_arm_hist_len_for_control);
-        if (!hist_ready_for_control || !arm_hist_ready_for_control)
+            ((!use_arm_policy_) || (required_arm_hist_len_for_control == 0) ||
+             (arm_hist_core_queue_.size() >= required_arm_hist_len_for_control));
+        if (!hist_ready_for_control || !arm_hist_ready_for_control || (mode7_warmup_steps_remaining_ > 0))
         {
+            // Keep user-specified mode7 init pose authoritative during warm-up.
+            applyMode7ArmInitPosePreset();
             const auto &vel_src = use_dtau_joint_vel_lpf_ ? q_dot_lpf_ : q_vel_noise_;
-            rd_.q_desired = q_init_;
-            torque_rl_ = kp_ * (q_init_ - q_noise_) - kv_ * vel_src;
+            Eigen::Matrix<double, MODEL_DOF, 1> warmup_target = q_init_mode7_;
+            if (mode7_init_pose_blend_active_)
+            {
+                const double t0 = mode7_init_pose_blend_start_us_;
+                const double tf = t0 + mode7_init_pose_blend_duration_s_ * 1.0e6;
+                const double t_now = static_cast<double>(rd_cc_.control_time_us_);
+                if (tf <= t0 || t_now >= tf)
+                {
+                    mode7_init_pose_blend_active_ = false;
+                }
+                else
+                {
+                    for (int i = 0; i < MODEL_DOF; ++i)
+                    {
+                        warmup_target(i) = DyrosMath::cubic(
+                            t_now, t0, tf, mode7_init_pose_blend_q0_(i), q_init_mode7_(i), 0.0, 0.0);
+                    }
+                }
+            }
+            rd_.q_desired = warmup_target;
+            torque_rl_ = kp_ * (warmup_target - q_noise_) - kv_ * vel_src;
 
             if (rd_cc_.control_time_us_ < start_time_ + 0.1e6)
             {
@@ -3339,11 +3297,8 @@ void CustomController::computeSlow()
         target_pos_arm.setZero();
         static int target_log_counter = 0;
         rd_.q_desired = q_init_mode7_;
-        if (use_arm_policy_)
-        {
-            rd_.q_desired(kLeftWrist1Joint) = 0.0;
-            rd_.q_desired(kRightWrist1Joint) = 0.0;
-        }
+        rd_.q_desired(kLeftWrist1Joint) = kMode7LeftWrist1Target;
+        rd_.q_desired(kRightWrist1Joint) = kMode7RightWrist1Target;
         if (!init_pose_hold_active_)
         {
             for (int i = 0; i < num_actuator_action; i++)
@@ -3380,12 +3335,17 @@ void CustomController::computeSlow()
                     target_pos_arm(i) = target;
                     rd_.q_desired(joint_idx) = target_pos_arm(i);
                 }
-                ROS_INFO_STREAM_THROTTLE(1.0,
-                    "[ARM_DBG] qdes="
-                    << target_pos_arm(0) << "," << target_pos_arm(1) << ","
-                    << target_pos_arm(2) << "," << target_pos_arm(3) << ","
-                    << target_pos_arm(4) << "," << target_pos_arm(5) << ","
-                    << target_pos_arm(6) << "," << target_pos_arm(7));
+                std::ostringstream arm_qdes_oss;
+                arm_qdes_oss << "[ARM_DBG] qdes=";
+                for (int i = 0; i < num_arm_action; ++i)
+                {
+                    if (i > 0)
+                    {
+                        arm_qdes_oss << ",";
+                    }
+                    arm_qdes_oss << target_pos_arm(i);
+                }
+                ROS_INFO_STREAM_THROTTLE(1.0, arm_qdes_oss.str());
             }
         }
         // bool log_due = debug_log_this_step_ || ((target_log_counter++ % 100) == 0);
@@ -3431,7 +3391,9 @@ void CustomController::computeSlow()
             for (int i = 0; i < MODEL_DOF; i++)
             {
                 const double hold_target =
-                    (use_arm_policy_ && (i == kLeftWrist1Joint || i == kRightWrist1Joint)) ? 0.0 : q_init_mode7_(i);
+                    (i == kLeftWrist1Joint) ? kMode7LeftWrist1Target :
+                    (i == kRightWrist1Joint) ? kMode7RightWrist1Target :
+                                               q_init_mode7_(i);
                 torque_rl_(i) = kp_(i, i) * (hold_target - q_noise_(i)) -
                                 kv_(i, i) * (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(i) : q_vel_noise_(i));
             }
@@ -3468,7 +3430,9 @@ void CustomController::computeSlow()
                 }
             }
             const double hold_target =
-                (use_arm_policy_ && (i == kLeftWrist1Joint || i == kRightWrist1Joint)) ? 0.0 : q_init_mode7_(i);
+                (i == kLeftWrist1Joint) ? kMode7LeftWrist1Target :
+                (i == kRightWrist1Joint) ? kMode7RightWrist1Target :
+                                           q_init_mode7_(i);
             torque_rl_(i) = kp_(i, i) * (hold_target - q_noise_(i)) -
                             kv_(i, i) * (use_dtau_joint_vel_lpf_ ? q_dot_lpf_(i) : q_vel_noise_(i));
         }
@@ -3508,6 +3472,8 @@ void CustomController::computeSlow()
     }
     prev_tc_mode_ = tc_mode;
     mode7_active_ = false;
+    g_mode7_blend_reseed_pending = false;
+    mode7_init_pose_blend_active_ = false;
     init_pose_hold_toggle_request_ = false;
     init_pose_hold_active_ = false;
     btn1_gravity_stopped_ = false;
@@ -3524,6 +3490,7 @@ void CustomController::computeSlow()
     ignore_stale_keyboard_cmd_ = false;
     cmd_stop_min_phase_cycles_ = 0.0;
     last_sim_time_observed_s_ = -1.0;
+    last_control_time_observed_us_ = -1;
     LF_CF_FT_pre = rd_cc_.LF_CF_FT;
     RF_CF_FT_pre = rd_cc_.RF_CF_FT;
 }
@@ -3843,6 +3810,8 @@ void CustomController::copyRobotData(RobotData &rd_l)
 void CustomController::guiSendCallback(const std_msgs::Empty::ConstPtr& msg)
 {
     mode7_send_triggered_ = true;
+    applyMode7ArmInitPosePreset();
+    mode7_warmup_steps_remaining_ = mode7_warmup_steps_target_;
 }
 
 void CustomController::handleMode7ToggleRequest()
@@ -3855,6 +3824,8 @@ void CustomController::handleMode7ToggleRequest()
         msg.mode = 7;
         task_cmd_pub_.publish(msg);
         mode7_send_triggered_ = true;
+        applyMode7ArmInitPosePreset();
+        mode7_warmup_steps_remaining_ = mode7_warmup_steps_target_;
         btn1_gravity_stopped_ = false;
         cmd_zero_lock_ = false;
         target_vel_raw_x_ = 0.0;
@@ -3881,6 +3852,8 @@ void CustomController::handleMode7ToggleRequest()
         msg.mode = 7;
         task_cmd_pub_.publish(msg);
         mode7_send_triggered_ = true;
+        applyMode7ArmInitPosePreset();
+        mode7_warmup_steps_remaining_ = mode7_warmup_steps_target_;
         btn1_gravity_stopped_ = false;
         cmd_zero_lock_ = false;
         target_vel_raw_x_ = 0.0;
@@ -4217,6 +4190,44 @@ void CustomController::joyCallback(const sensor_msgs::Joy::ConstPtr& joy)
         std_msgs::String msg;
         msg.data = "mjreset";
         sim_command_pub_.publish(msg);
+        // Force mode7 restart warm-up even if reset-time detection misses this event.
+        leg_hist_core_queue_.clear();
+        arm_hist_core_queue_.clear();
+        std::fill(state_buffer_.begin(), state_buffer_.end(), 0.0f);
+        std::fill(arm_state_buffer_.begin(), arm_state_buffer_.end(), 0.0f);
+        if (is_hist_encoder_)
+        {
+            std::fill(state_long_hist_.begin(), state_long_hist_.end(), 0.0f);
+        }
+        rl_action_.setZero();
+        rl_action_pre_.setZero();
+        rl_action_arm_.setZero();
+        rl_action_arm_pre_.setZero();
+        mode7_send_triggered_ = true;
+        mode7_init_pose_blend_active_ = false;
+        mode7_warmup_steps_remaining_ = mode7_warmup_steps_target_;
+        cmd_zero_lock_ = false;
+        cmd_resume_zero_hold_ticks_ = 25; // ~0.1s at 250 Hz
+        stale_keyboard_cmd_x_ = target_vel_raw_x_;
+        stale_keyboard_cmd_y_ = target_vel_raw_y_;
+        stale_keyboard_cmd_yaw_ = target_vel_raw_yaw_;
+        ignore_stale_keyboard_cmd_ = true;
+        target_vel_raw_x_ = 0.0;
+        target_vel_raw_y_ = 0.0;
+        target_vel_raw_yaw_ = 0.0;
+        target_vel_x_ = 0.0;
+        target_vel_y_ = 0.0;
+        target_vel_yaw_ = 0.0;
+        cmd_ema_initialized_ = true;
+        cmd_ema_last_us_ = rd_cc_.control_time_us_;
+        std_msgs::String reset_cmd_msg;
+        reset_cmd_msg.data = "keyboard_cmd_reset";
+        sim_command_pub_.publish(reset_cmd_msg);
+        std_msgs::String kb_unlock_msg;
+        kb_unlock_msg.data = "keyboard_cmd_unlock";
+        sim_command_pub_.publish(kb_unlock_msg);
+        ROS_INFO_STREAM("[MODE7] mjreset requested: forced warmup reset prepared (steps="
+                        << mode7_warmup_steps_remaining_ << ").");
     }
     prev_btn9_ = btn9;
 

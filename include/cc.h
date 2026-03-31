@@ -21,9 +21,6 @@
 #include <vector>
 #include <cstdint>
 
-#ifdef TOCABI_CC_USE_CASADI
-#include <casadi/casadi.hpp>
-#endif
 class CustomController
 {
 public:
@@ -43,7 +40,6 @@ public:
     void loadOnnX();
     void loadArmOnnX();
     void loadJointLimits();
-    void loadCasadiCMM();
     void processNoise();
     void processObservation();
     void processArmObservation();
@@ -55,6 +51,7 @@ public:
     void publishCommandVector();
     void publishActionRate();
     void updatePace();
+    void applyMode7ArmInitPosePreset();
     
     void quatToTanNorm(const Eigen::Quaterniond& quaternion, Eigen::Vector3d& tangent, Eigen::Vector3d& normal);
     Eigen::Vector3d mat2euler(Eigen::Matrix3d mat);
@@ -88,7 +85,8 @@ public:
     ///////////////////////////////////// Actor-Critic Network ///////////////////////////////////////
     static const int num_action = 12;
     static const int num_actuator_action = 12;
-    static const int num_arm_action = 8;
+    static const int num_arm_action = 2;
+    static const int num_arm_obs_joint = 8;
     // static const int num_cur_state = 49; // 37 + 12
     // LegActor obs: internal state excludes last_action (num_action).
     static const int num_cur_state = 50;
@@ -105,9 +103,12 @@ public:
     static const int num_long_hist_len = 50;
     static const int num_hist_state = num_long_hist_len * num_long_hist_skip;
 
-    // ArmActor obs: 3(base ang vel) + 3(gravity) + 8(q) + 8(qdot) + 8(last) + 3(CAM) + 3(CAM_des)
-    static const int num_arm_state = 36;
-    static const int num_arm_internal_state = num_arm_state - num_arm_action;
+    // ArmActor obs (latest task cfg):
+    // 3(base_ang_vel) + 3(projected_gravity) + 3(velocity_commands)
+    // + 12(leg q) + 12(leg qdot) + 8(arm q) + 8(arm qdot) + 2(last_arm_action)
+    static const int num_arm_state = 51;
+    // History core excludes one-step terms(velocity_commands, last_arm_action): 46
+    static const int num_arm_internal_state = 46;
 
     Eigen::MatrixXd rl_action_, rl_action_pre_, torq_diff_, energy;
     Eigen::Matrix<double, num_arm_action, 1> rl_action_arm_, rl_action_arm_pre_;
@@ -267,6 +268,7 @@ public:
     double sim_time_s_ = 0.0;
     double sim_time_prev_s_ = 0.0;
     double last_sim_time_observed_s_ = -1.0;
+    int64_t last_control_time_observed_us_ = -1;
     double cmd_scale_x_ = 1.0;
     double cmd_scale_y_ = 0.5;
     double cmd_scale_yaw_ = 0.6;
@@ -313,17 +315,6 @@ public:
     bool has_joint_limits_ = false;
     double q_limit_scale_ = 1.0;
 
-    bool use_casadi_cam_ = false;
-    std::string casadi_cmm_path_;
-// #ifdef TOCABI_CC_USE_CASADI
-//     bool casadi_cam_ready_ = false;
-// #else
-//     bool casadi_cam_ready_ = false;
-// #endif
-// #ifdef TOCABI_CC_USE_CASADI
-//     casadi::Function cmm_fn_;
-//     bool casadi_cam_ready_ = false;
-// #endif
     int debug_log_steps_remaining_ = 0;
     bool debug_log_this_step_ = false;
     bool mode7_active_ = false;
@@ -334,6 +325,12 @@ public:
     int prev_tc_mode_ = -1;
     bool mode6_logged_ = false;
     bool mode7_send_triggered_ = false;
+    bool mode7_init_pose_blend_active_ = false;
+    double mode7_init_pose_blend_start_us_ = 0.0;
+    double mode7_init_pose_blend_duration_s_ = 0.8;
+    Eigen::Matrix<double, MODEL_DOF, 1> mode7_init_pose_blend_q0_;
+    int mode7_warmup_steps_target_ = 40;
+    int mode7_warmup_steps_remaining_ = 0;
     size_t test_log_step_ = 0;
     size_t test_policy_step_ = 0;
     std::string test_log_dir_ = "/home/user/tocabi_mujoco_ws/src/tocabi_cc/test_log";

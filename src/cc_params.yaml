@@ -2,8 +2,8 @@ tocabi_cc:
   # Policy selection
   use_arm_policy: true
   policy_without_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/without_arm_hist/2026-03-09_13-27-45_model_30000_leg.onnx
-  policy_with_arm_leg: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/leg/2026-03-20_11-40-28_model_30000_leg.onnx
-  policy_with_arm_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/arm/2026-03-20_11-40-28_model_30000_arm.onnx
+  policy_with_arm_leg: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/without_arm_hist/2026-03-09_13-27-45_model_30000_leg.onnx
+  policy_with_arm_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/arm/2026-03-31_14-07-34_model_500_arm.onnx
   # Observation options
   include_cam_obs: false
   use_obs_history_layout: true
@@ -12,6 +12,8 @@ tocabi_cc:
 
   # Command/phase options
   policy_hz: 50.0
+  mode7_warmup_steps: 40
+  mode7_init_pose_blend_duration_s: 0.8
   phase_period: 1.6
   phase_offset: 0.0
   cmd_scale_x: 0.50  # max 0.5
@@ -29,27 +31,21 @@ tocabi_cc:
   # Joint mapping / controller defaults
   leg_joint_pos_limits:
     - [-0.3, 0.3]
-    - [-1.0, 1.0]
+    - [-0.5, 0.5]
     - [-1.0, 0.5]
     - [-0.3, 1.5]
     - [-0.8, 0.5]
     - [-0.6, 0.6]
     - [-0.3, 0.3]
-    - [-1.0, 1.0]
+    - [-0.5, 0.5]
     - [-1.0, 0.5]
     - [-0.3, 1.5]
     - [-0.8, 0.5]
     - [-0.6, 0.6]
 
   arm_joint_pos_limits:
-    - [-0.1, 0.7]
-    - [-0.2, 0.8]
-    - [1.4, 1.6]
-    - [-1.5, -0.5]
-    - [-0.7, 0.1]
-    - [-0.8, 0.2]
-    - [-1.6, -1.4]
-    - [0.5, 1.5]
+    - [ 0.0,  1.0]  # L_Shoulder2
+    - [-1.0, 0.0]  # R_Shoulder2
 
 
   torque_bound: [333, 232, 263, 289, 222, 166, 
@@ -62,9 +58,9 @@ tocabi_cc:
   q_init: [0.0, 0.0, -0.24, 0.6, -0.36, 0.0, 
            0.0, 0.0, -0.24, 0.6, -0.36, 0.0, 
            0.0, 0.0, 0.0, 
-           0.3, 0.3, 1.5, -1.27, -1.0, 0.0, -1.0, 0.0, 
+           0.0, 0.5, 1.5, -1.57, -1.0, 0.0, -1.0, 0.0, 
            0.0, 0.0, 
-           -0.3, -0.3, -1.5, 1.27, 1.0, 0.0, 1.0, 0.0]
+           0.0, -0.5, -1.5, 1.57, 1.0, 0.0, 1.0, 0.0]
 
   kp_diag: [2000.0, 5000.0, 4000.0, 3700.0, 3200.0, 3200.0, 
             2000.0, 5000.0, 4000.0, 3700.0, 3200.0, 3200.0, 
@@ -79,10 +75,6 @@ tocabi_cc:
             10.0, 28.0, 10.0, 10.0, 10.0, 10.0, 3.0, 3.0, 
             2.0, 2.0, 
             10.0, 28.0, 10.0, 10.0, 10.0, 10.0, 3.0, 3.0]
-
-  # CAM(CasADi) options
-  use_casadi_cam: false
-  casadi_cmm_path: /home/user/Downloads/LearningHumanoidArmMotion-RAL2025-Code-git/extensions/tocabi/dynamics/casadi_fns/CMM_dyros_tocabi.casadi
 
   # Optional action map override (12-dim each, uncomment if needed)
   # action_scale: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
