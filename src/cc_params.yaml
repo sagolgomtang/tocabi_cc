@@ -2,7 +2,7 @@ tocabi_cc:
   # Policy selection
   use_arm_policy: true
   policy_without_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/without_arm_hist/2026-03-09_13-27-45_model_30000_leg.onnx
-  policy_with_arm_leg: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/without_arm_hist/2026-03-09_13-27-45_model_30000_leg.onnx
+  policy_with_arm_leg: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/leg/2026-03-09_13-27-45_model_30000_leg copy.onnx
   policy_with_arm_arm: /home/user/tocabi_mujoco_ws/src/tocabi_cc/policy/arm_motion/with_arm/arm/2026-03-31_14-07-34_model_500_arm.onnx
   # Observation options
   include_cam_obs: false
