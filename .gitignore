@@ -6,3 +6,5 @@ SNpolicy/
 SNexp/
 snexp/
 cc.zip
+
+src/collect_chirp_data.py
