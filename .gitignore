@@ -2,3 +2,7 @@ result/*
 .vscode/*
 test_log/
 SNpolicy/
+
+SNexp/
+snexp/
+cc.zip
